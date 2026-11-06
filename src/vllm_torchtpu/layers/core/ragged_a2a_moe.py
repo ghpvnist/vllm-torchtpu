@@ -53,7 +53,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2_mlp_exchange
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
+    _is_fp4_weight,
     fused_moe_func,
     fused_moe_scatter,
     scatter_moe_supported,
@@ -716,6 +718,165 @@ def _direct_combine(
     )
 
 
+def _arrival_exchange(
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    gathered_ids,
+    read_routes,
+    experts_start,
+    *,
+    member_index,
+    tp_size,
+    dp_size,
+    topk,
+    activation,
+    rhs_quant_dtype,
+    skip_padded_tokens,
+    routes,
+    collective_id,
+):
+    """Dispatch, expert MLP and combine in one kernel: each routed token row
+    goes straight to the row of its expert's member's sorted lhs, and the member
+    starts an expert as soon as that expert's rows have landed; outputs return
+    as in ``_direct_combine``. Returns (out, fits); with fits false nothing was
+    sent and the caller takes the full-size exchange.
+    """
+    dp_size_, num_tokens, _ = gathered_ids.shape
+    local = w1.shape[0]
+    ep_rank = experts_start[0] // local
+    dp_pos = ep_rank // tp_size
+    num_groups = dp_size * local
+    member = member_index(gathered_ids)  # [D, S, K]
+    in_group = member < dp_size
+    valid = in_group
+    if skip_padded_tokens:
+        flat = (jnp.arange(dp_size * num_tokens, dtype=jnp.int32),)
+        _, weights = read_routes(flat[0])
+        weights = weights.astype(x.dtype).reshape(dp_size, num_tokens, topk)
+        weights = jnp.where(jnp.isfinite(weights), weights, 0)
+        valid = valid & (weights != 0)
+    group = jnp.where(valid, member * local + gathered_ids % local, num_groups)
+    hits = jax.nn.one_hot(
+        group.reshape(dp_size * num_tokens, topk), num_groups + 1, dtype=jnp.int32
+    )[..., :num_groups].sum(axis=1)  # [D * S, D * E]: one route at most
+    counts = hits.sum(axis=0).reshape(dp_size, local)
+    fits = counts.sum(axis=1).max() <= routes
+    valid = valid & fits
+    before = (jnp.cumsum(hits, axis=0, dtype=jnp.int32) - hits).reshape(
+        dp_size, num_tokens, num_groups
+    )
+    start = (jnp.cumsum(counts, axis=1, dtype=jnp.int32) - counts).reshape(-1)
+    # Selects instead of gathers: XLA gathers of a few thousand indices are slow.
+    hit = group[..., None] == jnp.arange(num_groups, dtype=jnp.int32)  # [D, S, K, G]
+    row = jnp.where(hit, start + before[:, :, None, :], 0).sum(axis=-1)
+    row = jnp.where(valid, row, routes)  # [D, S, K]: lhs row at the owner
+
+    # This member's sends, ordered by the owner's local group so that every
+    # member's first groups fill first.
+    mine = jax.lax.dynamic_index_in_dim(valid, dp_pos, keepdims=False)  # [S, K]
+    my_member = jax.lax.dynamic_index_in_dim(member, dp_pos, keepdims=False)
+    my_row = jax.lax.dynamic_index_in_dim(row, dp_pos, keepdims=False)
+    my_group = (
+        jax.lax.dynamic_index_in_dim(gathered_ids, dp_pos, keepdims=False) % local
+    )
+    num_routes = num_tokens * topk
+    route = jnp.arange(num_routes, dtype=jnp.int32)
+    key = (my_group.reshape(-1) * dp_size + my_member.reshape(-1)) * num_routes + route
+    key = jnp.where(mine.reshape(-1), key, jnp.iinfo(jnp.int32).max)
+    _, send_route, send_member, send_row, send_group = jax.lax.sort(
+        (
+            key,
+            route,
+            my_member.reshape(-1),
+            my_row.reshape(-1),
+            my_group.reshape(-1),
+        ),
+        num_keys=1,
+    )
+    send_token = send_route // topk
+    num_sends = mine.sum(dtype=jnp.int32)[None]
+
+    # This member's lhs rows: whose output each one is, and where it lands.
+    position = route_order(
+        gathered_ids.reshape(-1, topk), in_group.reshape(-1, topk)
+    ).reshape(dp_size, num_tokens, topk)
+    home = jnp.broadcast_to(
+        jnp.arange(dp_size, dtype=jnp.int32)[:, None, None], position.shape
+    )
+    token = jnp.broadcast_to(
+        jnp.arange(num_tokens, dtype=jnp.int32)[None, :, None], position.shape
+    )
+    here = valid & (member == dp_pos)
+    # lhs row j is the route of this member whose row is j (selects, no scatter).
+    match = (
+        jnp.where(here, row, -1).reshape(1, -1)
+        == jnp.arange(routes, dtype=jnp.int32)[:, None]
+    )  # [routes, D * S * K]
+    dest_member = jnp.where(match, home.reshape(1, -1), 0).sum(axis=1)
+    dest_row = jnp.where(match, (position * num_tokens + token).reshape(1, -1), 0).sum(
+        axis=1
+    )
+    group_sizes = jnp.where(
+        fits, jax.lax.dynamic_index_in_dim(counts, dp_pos, keepdims=False), 0
+    )
+
+    # Output rows other members send here: as _direct_combine.
+    own = member_index(topk_ids)
+    weights = topk_weights.astype(x.dtype)
+    weights = jnp.where(jnp.isfinite(weights), weights, 0)
+    remote = (own < dp_size) & (own != dp_pos)
+    if skip_padded_tokens:
+        remote = remote & (weights != 0)
+    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+
+    if w1_scale.ndim == 3:
+        w1_scale = jnp.expand_dims(w1_scale, 2)
+    if w2_scale.ndim == 3:
+        w2_scale = jnp.expand_dims(w2_scale, 2)
+    tokens = jnp.where(jnp.isfinite(x), x, 0)
+    recv = gmm_v2_mlp_exchange(
+        tokens,
+        w1,
+        w2,
+        group_sizes,
+        w1_scale,
+        w2_scale,
+        jnp.array([0], dtype=jnp.int32),
+        dest_member,
+        dest_row,
+        jnp.asarray(dp_pos, jnp.int32)[None],
+        expected[None],
+        send_token,
+        send_member,
+        send_row,
+        send_group,
+        num_sends,
+        size_m=routes,
+        num_recv_rows=num_tokens * topk,
+        axis=DP_AXIS,
+        num_members=dp_size,
+        collective_id=collective_id,
+        fuse_act=activation,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    out = home_sum_kernel(
+        recv,
+        topk_ids,
+        topk_weights,
+        member_index=member_index,
+        dp_size=dp_size,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=x.dtype,
+    )
+    return out, fits
+
+
 def ragged_a2a_moe_local(
     x: jax.Array,
     w1: jax.Array,
@@ -737,6 +898,7 @@ def ragged_a2a_moe_local(
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
     direct_combine: bool = False,
+    expert_arrival: bool = False,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -862,6 +1024,31 @@ def ragged_a2a_moe_local(
         # (the full exchange already runs the local-routes path over all routes).
         return full()
 
+    if expert_arrival and direct(rows, routes, 2) is not None:
+        # Routes bound the exchange alone here: no token rows are deduplicated.
+        out, fits = _arrival_exchange(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_ids,
+            topk_weights,
+            gathered_ids,
+            read_routes,
+            experts_start,
+            member_index=member_index,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            topk=topk,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            routes=routes,
+            collective_id=3,
+        )
+        return jax.lax.cond(fits, lambda: out, full)
+
     overflow = _capacity_overflow(
         gathered_ids,
         tp_size=tp_size,
@@ -909,6 +1096,7 @@ def ragged_a2a_moe(
     capacity_factor: float = 0.0,
     route_factor: float = 0.0,
     direct_combine: bool = False,
+    expert_arrival: bool = False,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -926,6 +1114,7 @@ def ragged_a2a_moe(
         capacity_factor=capacity_factor,
         route_factor=route_factor,
         direct_combine=direct_combine,
+        expert_arrival=expert_arrival,
     )
 
     def body(*args):

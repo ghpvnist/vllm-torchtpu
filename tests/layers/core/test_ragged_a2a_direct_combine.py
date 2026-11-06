@@ -408,3 +408,56 @@ def test_home_sum_kernel_matches_reference(num_tokens, skip_padded):
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
     )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("factor", [0.5, 2.0])
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,skew,padded",
+    [
+        (8, 1, 12, 2, False, False),
+        (8, 1, 12, 2, True, False),
+        (8, 1, 24, 10, False, False),
+        (8, 1, 24, 10, False, True),
+        (4, 2, 24, 10, False, False),
+        (4, 2, 24, 2, True, False),
+    ],
+)
+def test_expert_arrival_matches_returned_partials(
+    dp_size, tp_size, num_tokens, topk, skew, padded, factor
+):
+    """Experts started as their rows land: bitwise the returned-partials
+    exchange, whether the step fits the route capacity or falls back."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=skew
+    )
+    if padded:
+        weights = weights.reshape(8, num_tokens, topk).at[:, -5:].set(0)
+        weights = weights.reshape(-1, topk)
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        skip_padded_tokens=padded,
+        capacity_factor=factor,
+    )
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    got = np.asarray(
+        jax.jit(
+            functools.partial(
+                ragged_a2a_moe, direct_combine=True, expert_arrival=True, **common
+            )
+        )(*stacked)
+    )
+    assert np.abs(base.astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
