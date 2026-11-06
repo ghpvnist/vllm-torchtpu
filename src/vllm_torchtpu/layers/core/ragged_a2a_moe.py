@@ -877,6 +877,257 @@ def _arrival_exchange(
     return out, fits
 
 
+def owner_route_key(ids, *, dp_size, tp_size, local_num_experts):
+    """(valid, key, tp, dp) of each route for the owner-side sum: routes ordered
+    by the TP rank of their expert, then its DP position, then the local
+    expert; ``valid`` false for ids that name no expert of the mesh."""
+    num_ranks = dp_size * tp_size
+    rank = ids // local_num_experts
+    valid = (ids >= 0) & (rank < num_ranks)
+    tp = rank % tp_size
+    dp = rank // tp_size
+    key = (tp * dp_size + dp) * local_num_experts + ids % local_num_experts
+    return valid, key, tp, dp
+
+
+def owner_order(ids, **mesh):
+    """Position of each route among its token's routes in owner-key order
+    (invalid ids last, by k): a permutation of 0..K-1 per row."""
+    topk = ids.shape[-1]
+    valid, key, _, _ = owner_route_key(ids, **mesh)
+    k = jnp.arange(topk, dtype=jnp.int32)
+    key = jnp.where(valid, key, (1 << 24) + k)
+    return (key[..., None, :] < key[..., :, None]).sum(axis=-1, dtype=jnp.int32)
+
+
+def _owner_routes(topk_ids, topk_weights, *, skip_padded_tokens, dtype, **mesh):
+    """Per owner-order position, each [K, N]: TP rank of the route's expert
+    (``tp_size``: none), its DP position, whether an output comes for it, its
+    weight in f32."""
+    topk = topk_ids.shape[1]
+    tp_size = mesh["tp_size"]
+    valid, _, tp, dp = owner_route_key(topk_ids, **mesh)
+    weights = topk_weights.astype(dtype)
+    weights = jnp.where(jnp.isfinite(weights), weights, 0)
+    sent = valid & (weights != 0) if skip_padded_tokens else valid
+    order = owner_order(topk_ids, **mesh)
+    pick = order[:, :, None] == jnp.arange(topk, dtype=jnp.int32)  # [N, k, j]
+
+    def at(v):
+        return jnp.where(pick, v[:, :, None], 0).sum(axis=1).T
+
+    tp_s = at(jnp.where(valid, tp, tp_size))
+    dp_s = at(dp)
+    sent_s = (pick & sent[:, :, None]).any(axis=1).T
+    weight_s = jnp.where(pick, weights[:, :, None].astype(jnp.float32), 0).sum(axis=1).T
+    return tp_s, dp_s, sent_s, weight_s
+
+
+def _owner_sum_ref(recv, topk_ids, topk_weights, *, skip_padded_tokens, dtype, **mesh):
+    """jnp form of `owner_sum_kernel` (CPU tests)."""
+    num_tokens, topk = topk_ids.shape
+    tp_size = mesh["tp_size"]
+    tp_s, dp_s, sent_s, weight_s = _owner_routes(
+        topk_ids,
+        topk_weights,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+        **mesh,
+    )
+    rows = recv.reshape(topk, num_tokens, *recv.shape[1:])
+    shape = (num_tokens,) + recv.shape[1:]
+    info = jnp.finfo(dtype)
+
+    def round_to(a):
+        return jax.lax.reduce_precision(
+            a, exponent_bits=info.nexp, mantissa_bits=info.nmant
+        )
+
+    b = (slice(None),) + (None,) * (len(shape) - 1)
+    acc_m = jnp.zeros(shape, jnp.float32)
+    acc_r = jnp.zeros(shape, jnp.float32)
+    out = jnp.zeros(shape, jnp.float32)
+    for j in range(topk):
+        prod = jnp.where(
+            sent_s[j][b], weight_s[j][b] * rows[j].astype(jnp.float32), 0.0
+        )
+        if j:
+            new_r = tp_s[j] != tp_s[j - 1]
+            new_m = new_r | (dp_s[j] != dp_s[j - 1])
+            acc_r = jnp.where(new_r[b], 0.0, acc_r)
+            acc_m = jnp.where(new_m[b], 0.0, acc_m)
+        acc_m = acc_m + prod
+        group = tp_s[j] < tp_size
+        if j + 1 < topk:
+            end_r = tp_s[j + 1] != tp_s[j]
+            end_m = end_r | (dp_s[j + 1] != dp_s[j])
+        else:
+            end_r = end_m = jnp.ones_like(group)
+        acc_r = acc_r + jnp.where((group & end_m)[b], round_to(acc_m), 0.0)
+        out = out + jnp.where((group & end_r)[b], round_to(acc_r), 0.0)
+    return out.astype(dtype).reshape(num_tokens, -1)
+
+
+def owner_sum_kernel(
+    recv, topk_ids, topk_weights, *, skip_padded_tokens, dtype, **mesh
+):
+    """This rank's owned tokens' MoE outputs from all their routes, in one
+    Pallas kernel. ``recv`` [K * N, 16, H / 16]: route position ``j`` (owner
+    order) of owned token ``i`` at row ``j * N + i``. Per TP rank of the
+    experts: per DP member, its routes summed in f32 in expert order and
+    rounded once; the members summed in f32 and rounded once (the per-rank
+    partial of the returned-partials path); then the TP ranks' partials summed
+    in f32 in rank order and rounded once."""
+    num_tokens, topk = topk_ids.shape
+    tp_size = mesh["tp_size"]
+    tp_s, dp_s, sent_s, weight_s = _owner_routes(
+        topk_ids,
+        topk_weights,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+        **mesh,
+    )
+    sent_s = sent_s.astype(jnp.int32)
+    rows = recv.reshape(topk, num_tokens, *recv.shape[1:])
+    tb = _home_sum_tokens(num_tokens)
+    row_shape = recv.shape[1:]
+
+    def kernel(tp_ref, dp_ref, sent_ref, weight_ref, rows_ref, out_ref):
+        base = pl.program_id(0) * tb
+        for i in range(tb):
+            t = base + i
+            acc_m = jnp.zeros(row_shape, jnp.float32)
+            acc_r = jnp.zeros(row_shape, jnp.float32)
+            out = jnp.zeros(row_shape, jnp.float32)
+            for j in range(topk):
+                r = tp_ref[j, t]
+                d = dp_ref[j, t]
+                row = rows_ref[j, i].astype(jnp.float32)
+                prod = jnp.where(sent_ref[j, t] != 0, weight_ref[j, t] * row, 0.0)
+                if j:
+                    new_r = r != tp_ref[j - 1, t]
+                    new_m = jnp.logical_or(new_r, d != dp_ref[j - 1, t])
+                    acc_r = jnp.where(new_r, 0.0, acc_r)
+                    acc_m = jnp.where(new_m, 0.0, acc_m)
+                acc_m = acc_m + prod
+                group = r < tp_size
+                if j + 1 < topk:
+                    end_r = tp_ref[j + 1, t] != r
+                    end_m = jnp.logical_or(end_r, dp_ref[j + 1, t] != d)
+                else:
+                    end_r = end_m = True
+                part = acc_m.astype(dtype).astype(jnp.float32)
+                acc_r = acc_r + jnp.where(jnp.logical_and(group, end_m), part, 0.0)
+                part_r = acc_r.astype(dtype).astype(jnp.float32)
+                out = out + jnp.where(jnp.logical_and(group, end_r), part_r, 0.0)
+            out_ref[i] = out.astype(out_ref.dtype)
+
+    out = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((num_tokens,) + row_shape, dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(num_tokens // tb,),
+            in_specs=[
+                pl.BlockSpec(
+                    (topk, tb) + row_shape, lambda g, *_: (0, g) + (0,) * len(row_shape)
+                )
+            ],
+            out_specs=pl.BlockSpec(
+                (tb,) + row_shape, lambda g, *_: (g,) + (0,) * len(row_shape)
+            ),
+        ),
+        name="ragged_a2a_owner_sum",
+    )(tp_s, dp_s, sent_s, weight_s, rows)
+    return out.reshape(num_tokens, -1)
+
+
+def _owner_combine(
+    received,
+    recv_weights,
+    recv_ids,
+    home_member,
+    home_token,
+    dp_pos,
+    fits,
+    *,
+    x,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    experts_start,
+    member_index,
+    dp_size,
+    tp_size,
+    topk,
+    activation,
+    rhs_quant_dtype,
+    skip_padded_tokens,
+    max_local_routes,
+    collective_id,
+):
+    """Expert outputs written straight to their token's OWNER core: TP rank
+    ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
+    all of the token's routes (every TP rank's experts) and the engine's TP
+    ranks all-gather the owned rows: the result is already summed over TP."""
+    num_tokens = x.shape[0]
+    local = w1.shape[0]
+    mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+    blk = -(-num_tokens // tp_size)
+    ep_rank = experts_start[0] // local
+    my_tp = ep_rank % tp_size
+    me = dp_pos * tp_size + my_tp
+    dest = home_member * tp_size + home_token // blk
+    row_dest = owner_order(recv_ids, **mesh) * blk + (home_token % blk)[:, None]
+    pad = blk * tp_size - num_tokens
+    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
+    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+    owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
+    owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
+    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
+    w = owned_weights.astype(x.dtype)
+    w = jnp.where(jnp.isfinite(w), w, 0)
+    if skip_padded_tokens:
+        valid = valid & (w != 0)
+    remote = valid & (owned_ids // local != ep_rank)
+    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
+    recv = fused_moe_scatter(
+        received,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        recv_weights,
+        recv_ids,
+        experts_start[0],
+        dest.astype(jnp.int32),
+        row_dest.astype(jnp.int32),
+        jnp.asarray(me, jnp.int32)[None],
+        expected[None],
+        topk=topk,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+        max_local_routes=max_local_routes,
+        num_recv_rows=blk * topk,
+        axis=(DP_AXIS, TP_AXIS),
+        num_members=(dp_size, tp_size),
+        collective_id=collective_id,
+    )
+    owned = owner_sum_kernel(
+        recv,
+        owned_ids,
+        owned_weights,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=x.dtype,
+        **mesh,
+    )
+    return jax.lax.all_gather(owned, TP_AXIS, tiled=True)[:num_tokens]
+
+
 def ragged_a2a_moe_local(
     x: jax.Array,
     w1: jax.Array,
@@ -899,6 +1150,7 @@ def ragged_a2a_moe_local(
     route_factor: float = 0.0,
     direct_combine: bool = False,
     expert_arrival: bool = False,
+    owner_combine: bool = False,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -919,6 +1171,10 @@ def ragged_a2a_moe_local(
     with a second exchange. The sum differs from the returned-partials path only
     in the order of a member's f32 accumulation of three or more routes of one
     token (``_home_sum``).
+
+    With ``owner_combine`` the expert outputs go to their token's owner core
+    instead (``_owner_combine``) and the result is ALREADY summed over the TP
+    ranks: paths without the fused kernel then add the TP all-reduce here.
     """
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
@@ -935,7 +1191,7 @@ def ragged_a2a_moe_local(
 
     def direct(recv_rows, max_local_routes, collective_id):
         """None when the exchange's local MoE does not take the fused kernel."""
-        if not direct_combine or not scatter_moe_supported(
+        if not (direct_combine or owner_combine) or not scatter_moe_supported(
             jax.ShapeDtypeStruct((recv_rows, x.shape[1]), x.dtype),
             w1,
             w2,
@@ -949,6 +1205,27 @@ def ragged_a2a_moe_local(
             rhs_quant_dtype=rhs_quant_dtype,
         ):
             return None
+        if owner_combine:
+            return functools.partial(
+                _owner_combine,
+                x=x,
+                w1=w1,
+                w2=w2,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                experts_start=experts_start,
+                member_index=member_index,
+                dp_size=dp_size,
+                tp_size=tp_size,
+                topk=topk,
+                activation=activation,
+                rhs_quant_dtype=rhs_quant_dtype,
+                skip_padded_tokens=skip_padded_tokens,
+                max_local_routes=max_local_routes,
+                collective_id=collective_id,
+            )
         return functools.partial(
             _direct_combine,
             x=x,
@@ -994,8 +1271,17 @@ def ragged_a2a_moe_local(
 
         return run
 
+    def finish(out, reduced):
+        # Owner mode returns TP-summed rows; a path without the fused kernel
+        # returns this rank's partial.
+        if owner_combine and not reduced:
+            return jax.lax.psum(out, TP_AXIS)
+        return out
+
+    full_direct = direct(slots, slots * topk, 1)
+
     def full():
-        return _full_exchange(
+        out = _full_exchange(
             x,
             w1,
             topk_ids,
@@ -1005,8 +1291,9 @@ def ragged_a2a_moe_local(
             tp_size=tp_size,
             dp_size=dp_size,
             moe=moe(slots * topk),
-            direct=direct(slots, slots * topk, 1),
+            direct=full_direct,
         )
+        return finish(out, full_direct is not None)
 
     rows, routes = exchange_capacity(
         dp_size=dp_size,
@@ -1024,7 +1311,7 @@ def ragged_a2a_moe_local(
         # (the full exchange already runs the local-routes path over all routes).
         return full()
 
-    if expert_arrival and direct(rows, routes, 2) is not None:
+    if expert_arrival and not owner_combine and direct(rows, routes, 2) is not None:
         # Routes bound the exchange alone here: no token rows are deduplicated.
         out, fits = _arrival_exchange(
             x,
@@ -1058,6 +1345,7 @@ def ragged_a2a_moe_local(
     )
     # The capacity exchange runs outside the conditional, so the schedule
     # around it (weight prefetches for the following layers) is unchanged.
+    capacity_direct = direct(rows, routes, 2)
     out = _capacity_exchange(
         x,
         w1,
@@ -1071,8 +1359,9 @@ def ragged_a2a_moe_local(
         dp_size=dp_size,
         rows=rows,
         moe=moe(routes),
-        direct=direct(rows, routes, 2),
+        direct=capacity_direct,
     )
+    out = finish(out, capacity_direct is not None)
     return jax.lax.cond(overflow, full, lambda: out)
 
 
@@ -1097,6 +1386,7 @@ def ragged_a2a_moe(
     route_factor: float = 0.0,
     direct_combine: bool = False,
     expert_arrival: bool = False,
+    owner_combine: bool = False,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -1115,6 +1405,7 @@ def ragged_a2a_moe(
         route_factor=route_factor,
         direct_combine=direct_combine,
         expert_arrival=expert_arrival,
+        owner_combine=owner_combine,
     )
 
     def body(*args):

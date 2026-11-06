@@ -1654,11 +1654,9 @@ class ScatterRefs:
     send_sems: jax.Array  # DMA[2]
     local_sems: jax.Array  # DMA[2]
     recv_sem: jax.Array  # DMA[1]
-    in_flight: (
-        jax.Array
-    )  # SMEM int32[4]: remote, remote, local, local rows per stage slot
-    axis: str
-    num_members: int
+    in_flight: jax.Array  # SMEM int32[4]: rows in flight (remote x2, local x2)
+    axis: str | tuple[str, ...]
+    num_members: int | tuple[int, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1680,23 +1678,48 @@ class ArrivalRefs:
     sent: jax.Array  # SMEM int32[1]: remote rows sent
 
 
-def _signal_all(sem, axis: str, n: int) -> None:
-    for i in range(n):
+def _axes(axis, num_members):
+    if isinstance(axis, str):
+        return (axis,), (num_members,)
+    return tuple(axis), tuple(num_members)
+
+
+def member_device(index, axis, num_members) -> dict:
+    """Mesh coordinates of member `index`, members numbered row-major over the
+    given axes (other mesh axes keep the caller's coordinate)."""
+    axes, sizes = _axes(axis, num_members)
+    coords = {}
+    for a, n in zip(reversed(axes[1:]), reversed(sizes[1:])):
+        coords[a] = lax.rem(index, n)
+        index = index // n
+    coords[axes[0]] = index
+    return coords
+
+
+def _signal_all(sem, axis, num_members) -> None:
+    axes, sizes = _axes(axis, num_members)
+    total = 1
+    for n in sizes:
+        total *= n
+    for i in range(total):
+        coords, rest = {}, i
+        for a, n in zip(reversed(axes), reversed(sizes)):
+            coords[a] = rest % n
+            rest //= n
         pl.semaphore_signal(
-            sem, 1, device_id={axis: i}, device_id_type=pl.DeviceIdType.MESH
+            sem, 1, device_id=coords, device_id_type=pl.DeviceIdType.MESH
         )
-    pl.semaphore_wait(sem, n)
+    pl.semaphore_wait(sem, total)
 
 
-def member_barrier(axis: str, n: int) -> None:
-    """Every member of `axis` has entered the kernel. A second round on a
-    scoped semaphore keeps back-to-back kernels from consuming each other's
-    signals."""
-    _signal_all(pltpu.get_barrier_semaphore(), axis, n)
+def member_barrier(axis, num_members) -> None:
+    """Every member has entered the kernel. A second round on a scoped
+    semaphore keeps back-to-back kernels from consuming each other's signals."""
+    _signal_all(pltpu.get_barrier_semaphore(), axis, num_members)
 
     @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
     def _(second):
-        _signal_all(second, axis, n)
+        _signal_all(second, axis, num_members)
 
 
 # Rows of one semaphore wait: a wait names a row-sized block of the receive
@@ -1819,7 +1842,7 @@ def _mlp_kernel(
                     dst,
                     ar.send_sem.at[0],
                     sem,
-                    device_id={scatter.axis: member},
+                    device_id=member_device(member, scatter.axis, scatter.num_members),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
@@ -1915,7 +1938,7 @@ def _mlp_kernel(
                     dst,
                     sc.send_sems.at[slot],
                     sc.recv_sem.at[0],
-                    device_id={sc.axis: member},
+                    device_id=member_device(member, sc.axis, sc.num_members),
                     device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
@@ -2378,8 +2401,8 @@ def mlp_scatter_kernel_main(
     in_flight_ref,
     *,
     cfgs: MlpConfigs,
-    axis: str,
-    num_members: int,
+    axis,
+    num_members,
 ):
     """Entry point of `gmm_v2_mlp_scatter`."""
     _mlp_kernel(
@@ -2460,8 +2483,8 @@ def gmm_v2_mlp_scatter(
     expected: jax.Array,  # int32[1]
     *,
     num_recv_rows: int,
-    axis: str,
-    num_members: int,
+    axis: str | tuple[str, ...],
+    num_members: int | tuple[int, ...],
     collective_id: int,
     fuse_act: str,
     num_parts: int = 2,
@@ -2474,7 +2497,8 @@ def gmm_v2_mlp_scatter(
     """`gmm_v2_mlp` whose output rows go to their owners as they are computed.
 
     A collective kernel over the `num_members` members of mesh axis `axis`
-    (other mesh axes keep the caller's coordinate). Output row `j` (a routed
+    (other mesh axes keep the caller's coordinate), or over the members of
+    several axes given as tuples, numbered row-major. Output row `j` (a routed
     row of lhs) is sent to row `dest_row[j]` of member `dest_member[j]`'s
     receive buffer as soon as its tile's down projection is done, while the
     following experts compute; rows for this member (`me`) are local copies.
