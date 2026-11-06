@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     TPU_MOE_A2A_CAPACITY: float = 2.5
     TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
     TPU_MOE_A2A_DIRECT_COMBINE: bool = False
+    TPU_MOE_A2A_OWNER_COMBINE: bool = False
     TPU_MOE_ROUTING_REPLAY: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
@@ -833,6 +834,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output row to its home rank as soon as it is computed, and the home rank
     # sums them, instead of a combine and a second exchange after the experts.
     "TPU_MOE_A2A_DIRECT_COMBINE": env_bool("TPU_MOE_A2A_DIRECT_COMBINE"),
+    # Ragged all-to-all exchange: the expert kernel sends each output row to the
+    # TP rank of the token's engine that owns the token, with the shared
+    # expert's partials; the owner sums them and the engine all-gathers, so the
+    # MoE output needs no TP all-reduce.
+    "TPU_MOE_A2A_OWNER_COMBINE": env_bool("TPU_MOE_A2A_OWNER_COMBINE"),
     # Profiling only: the router emits the expert ids captured in this .npz
     # (ids [layers, windows, positions, topk]); see
     # layers/adapter/routing_replay.py. Model output is meaningless.
