@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import chips
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -30,7 +32,6 @@ if TYPE_CHECKING:
         AdvisorSweepReport,
         ModelProfile,
         RegimeEntry,
-        chips,
     )
 
 _MOE_MODE_SHORT_HINTS: Mapping[str, str] = {
@@ -66,6 +67,32 @@ def _esc(val: object) -> str:
     return "" if val is None else html.escape(str(val))
 
 
+def _entry_rec_scope_dict(entry: RegimeEntry) -> Mapping[str, object]:
+    """Return the ScopeEstimate mapping matching `entry.recommended_scope`."""
+    for sc in entry.scopes:
+        if sc.get("scope") == entry.recommended_scope:
+            return sc
+    return entry.scopes[0] if entry.scopes else {}
+
+
+def _format_ring_pair(sc: Mapping[str, object]) -> str:
+    """Format `(nbd, nbe)` ring slots when present on a scope dictionary."""
+    nbd = int(str(sc.get("selected_nbd", 0)))
+    nbe = int(str(sc.get("selected_nbe", 0)))
+    return f"({nbd},{nbe})" if nbd > 0 else "-"
+
+
+def _entry_gain_split_us(entry: RegimeEntry) -> tuple[float, float]:
+    """Extract compiler-proof physics gain and dispatch bubble gain in us."""
+    cp_us = float(
+        str(entry.metrics.get("compiler_proof_gain_us", {}).get("value", 0.0))
+    )
+    db_us = float(
+        str(entry.metrics.get("dispatch_bubble_gain_us", {}).get("value", 0.0))
+    )
+    return cp_us, db_us
+
+
 def format_advisor_summary(
     rep: AdvisorReport, *, explain: bool = False, unresolved: bool = False
 ) -> str:
@@ -90,9 +117,20 @@ def format_advisor_summary(
             f"Ridge: {ridge_fb:.1f} FLOP/B (T_ridge={rep.ridge_tokens})"
         ),
     ]
+    cp_metric = rep.metrics.get("compiler_proof_gain_us")
+    db_metric = rep.metrics.get("dispatch_bubble_gain_us")
+    if cp_metric is not None and db_metric is not None:
+        cp_val = float(str(cp_metric.get("value", 0.0)))
+        db_val = float(str(db_metric.get("value", 0.0)))
+        lines.append(
+            f"Compiler-Proof Physics Gain: {cp_val:+.2f} us | "
+            f"Dispatch Bubble Gain: {db_val:+.2f} us"
+        )
     lines.extend(
         f"  - {sc.scope:12s} {sc.step_bound_us:9.1f} us "
+        f"(Derated Achievable Step={sc.step_achievable_us:9.1f} us) "
         f"[t_max={sc.t_vmem_max:4d}, passes={sc.n_splits:2d}, "
+        f"ring=({sc.selected_nbd},{sc.selected_nbe}), "
         f"static_vmem={sc.vmem_static_mib:5.2f} MiB]"
         for sc in rep.scopes
     )
@@ -186,6 +224,20 @@ def format_regime_table(sweep: AdvisorSweepReport) -> str:
         f"{entry.step_bound_us:10.1f}"
         for entry in sweep.regimes
     )
+    if sweep.regimes:
+        lines.append("")
+        lines.append("Investment Triage (Derated Achievable Step, Ring, Gain Split):")
+        for entry in sweep.regimes:
+            rec_sc = _entry_rec_scope_dict(entry)
+            ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
+            ring_txt = _format_ring_pair(rec_sc)
+            cp_us, db_us = _entry_gain_split_us(entry)
+            lines.append(
+                f"  * {entry.label}: Derated Achievable Step={ach_us:.1f} us | "
+                f"ring={ring_txt} | "
+                f"Compiler-Proof Physics Gain={cp_us:+.1f} us | "
+                f"Dispatch Bubble Gain={db_us:+.1f} us"
+            )
     lines.extend(
         [
             "",
@@ -671,7 +723,10 @@ def _render_ledger_row(entry: RegimeEntry) -> str:
         f"<tr><td><code>{_esc(sc['scope'])}</code></td>"
         f"<td>{'yes' if sc['feasible'] else 'no'}</td>"
         f'<td class="tabular">{float(str(sc["step_bound_us"])):,.1f}</td>'
+        f'<td class="tabular">'
+        f"{float(str(sc.get('step_achievable_us', sc['step_bound_us']))):,.1f}</td>"
         f'<td class="tabular">{float(str(sc["step_upper_us"])):,.1f}</td>'
+        f'<td class="tabular">{_esc(_format_ring_pair(sc))}</td>'
         f'<td class="tabular">{_esc(sc["ops_per_step"])}</td>'
         f'<td class="tabular">{_esc(sc["n_splits"])}</td></tr>'
         for sc in entry.scopes
@@ -679,7 +734,9 @@ def _render_ledger_row(entry: RegimeEntry) -> str:
     summary = ", ".join(f"{counts[t]} {t.lower()}" for t in _PROVENANCE_TAGS)
     scope_table = (
         '<table class="ledger-table"><thead><tr><th>Scope</th><th>Feasible</th>'
-        '<th class="tabular">Floor (us)</th><th class="tabular">Upper (us)</th>'
+        '<th class="tabular">Floor (us)</th>'
+        '<th class="tabular">Achievable (us)</th>'
+        '<th class="tabular">Upper (us)</th><th>Ring</th>'
         '<th class="tabular">Launches</th><th class="tabular">Passes</th>'
         f"</tr></thead><tbody>{''.join(scope_rows)}</tbody></table>"
         if scope_rows
@@ -845,6 +902,15 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
                 '<span class="verdict-tag verdict-separate">SEPARATE OPS</span>'
             )
 
+        rec_sc = _entry_rec_scope_dict(entry)
+        ach_us = float(str(rec_sc.get("step_achievable_us", entry.step_bound_us)))
+        ring_str = _format_ring_pair(rec_sc)
+        ring_sub = (
+            f'<div class="kpi-sub">ring=<code>{_esc(ring_str)}</code></div>'
+            if ring_str != "-"
+            else ""
+        )
+        cp_us, db_us = _entry_gain_split_us(entry)
         rows_html.append(
             "<tr>"
             f"<td><strong>{_esc(entry.label)}</strong></td>"
@@ -853,12 +919,15 @@ def _render_decision_table_rows(sweep: AdvisorSweepReport) -> list[str]:
             f'<td class="tabular">{entry.step_arithmetic_intensity:.2f}</td>'
             f'<td class="tabular">{entry.num_vmem_splits}</td>'
             f'<td><span class="badge badge-{scope}">{scope}</span>'
-            f'<div class="kpi-sub"><code>{_esc(moe_mode)}</code></div></td>'
+            f'<div class="kpi-sub"><code>{_esc(moe_mode)}</code></div>'
+            f"{ring_sub}</td>"
             f'<td class="tabular">{tput_val:,.1f}</td>'
-            f'<td class="tabular {gain_cls}">{gain_str}</td>'
+            f'<td class="tabular {gain_cls}">{gain_str}'
+            f'<div class="kpi-sub tabular" style="text-align: right;">'
+            f"physics: {cp_us:+.1f} us | dispatch: {db_us:+.1f} us</div></td>"
             f'<td class="tabular">{entry.step_bound_us:,.1f}'
             f'<div class="kpi-sub tabular" style="text-align: right;">'
-            f"upper: {hi_us:,.1f} us</div></td>"
+            f"achievable: {ach_us:,.1f} us<br/>upper: {hi_us:,.1f} us</div></td>"
             f"<td>{verdict_cell}</td>"
             f"<td>{flags_cell}</td>"
             f"<td>{_esc(entry.rationale)}</td>"
@@ -1078,6 +1147,8 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     safe_json = json.dumps(sweep.to_dict(), indent=2).replace("</", "<\\/")
 
     facts_card_html = _render_facts_ledger_card(sweep)
+    chip_spec = sweep.chip_spec or chips.resolve_chip_spec(sweep.chip)
+    _ = chip_spec.vmem_usable_bytes
     rows_html = _render_decision_table_rows(sweep)
     rules_html = "".join(f"<li>{_esc(r)}</li>" for r in sweep.tailoring_guide)
     mode_src = rec.source or ("auto-derived" if rec.auto_selected else "manual")

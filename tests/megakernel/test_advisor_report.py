@@ -278,3 +278,30 @@ def test_render_advisor_html_handles_chip_spec_without_sources() -> None:
     sweep = advisor.advise_regimes(profile, chip_no_sources)
     html_out = advisor.render_advisor_html(sweep)
     assert "<!DOCTYPE html>" in html_out or "<html" in html_out
+
+
+def test_report_surfaces_gain_split_ring_and_achievable_step() -> None:
+    """Verify CLI summary, regime table, and HTML surface gain split and ring slots."""
+    rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
+        "tpu7x",
+    )
+    summary_txt = advisor.format_advisor_summary(rep)
+    assert "Compiler-Proof Physics Gain:" in summary_txt
+    assert "Dispatch Bubble Gain:" in summary_txt
+    assert "Derated Achievable Step=" in summary_txt
+    assert "ring=(14,10)" in summary_txt
+
+    sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    table_txt = advisor.format_regime_table(sweep)
+    assert "Compiler-Proof Physics Gain=" in table_txt
+    assert "Dispatch Bubble Gain=" in table_txt
+    assert "Derated Achievable Step=" in table_txt
+    assert "ring=(14,10)" in table_txt
+
+    html_out = advisor.render_advisor_html(sweep)
+    assert "physics:" in html_out
+    assert "dispatch:" in html_out
+    assert "achievable:" in html_out
+    assert "ring=<code>(14,10)</code>" in html_out

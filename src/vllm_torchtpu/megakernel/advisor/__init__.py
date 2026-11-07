@@ -3079,10 +3079,13 @@ def advise_regimes(
                         "scope": s.scope,
                         "feasible": s.feasible,
                         "step_bound_us": s.step_bound_us,
+                        "step_achievable_us": s.step_achievable_us,
                         "step_upper_us": s.step_upper_us,
                         "ops_per_step": s.ops_per_step,
                         "n_splits": s.n_splits,
                         "t_vmem_max": s.t_vmem_max,
+                        "selected_nbd": s.selected_nbd,
+                        "selected_nbe": s.selected_nbe,
                     }
                     for s in rep.scopes
                 ),
