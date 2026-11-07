@@ -346,3 +346,87 @@ def test_window_tile_matches_inner_kernel(schedule, monkeypatch):
             monkeypatch, _pooled_call, ref_pool, step, weights
         )
         _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")
+
+
+def _block_bytes(pool, block, pages=SPLIT, half_last=False):
+    """Raw bytes of manager block `block` (its first `pages` pages; with
+    `half_last`, only the first half of the last one: the conv state)."""
+    raw = np.asarray(pool).view(np.uint8)[block * SPLIT : block * SPLIT + pages]
+    raw = raw.reshape(pages, -1)
+    if half_last:
+        return np.concatenate([raw[:-1].reshape(-1), raw[-1, : raw.shape[1] // 2]])
+    return raw.reshape(-1)
+
+
+TWO_SLOT_SCHEDULES = {
+    # The 4-host operating point: full windows, every acceptance count.
+    "served": dict(seqs=24, lens=lambda t, s: W, live=24),
+    # 1-4 token windows (one-token windows commit), padded tail slots.
+    "mixed": dict(seqs=12, lens=lambda t, s: 1 + (3 * s + t) % W, live=10),
+    # Verify windows followed by prefill chunks of resuming sequences.
+    "prefill": dict(seqs=8, lens=lambda t, s: (37, 70)[s - 6] if s >= 6 else W, live=8),
+}
+
+
+@pytest.mark.parametrize("schedule", sorted(TWO_SLOT_SCHEDULES))
+def test_two_slot_checkpoints_match_window_checkpoints(schedule):
+    """Two state blocks per sequence plus recomputation of accepted tokens
+    give the same outputs, and the same committed state bytes, as one block
+    per window position, over steps covering every acceptance count."""
+    spec = TWO_SLOT_SCHEDULES[schedule]
+    seqs, live = spec["seqs"], spec["live"]
+    windowed = 6 if schedule == "prefill" else live
+    ckpt4 = 1 + np.arange(seqs)[:, None] * W + np.arange(W)[None]
+    ckpt2 = 1 + np.arange(seqs)[:, None] * 2 + np.arange(2)[::-1][None]
+    pool4 = _pool(7, 1 + seqs * W + 1)
+    raw2 = np.asarray(_pool(8, 1 + seqs * 2 + 1)).view(np.uint8).copy()
+    raw4 = np.asarray(pool4).view(np.uint8)
+    for s in range(seqs):
+        dst, src = ckpt2[s, 0] * SPLIT, ckpt4[s, 0] * SPLIT
+        raw2[dst : dst + SPLIT] = raw4[src : src + SPLIT]
+    pool2 = jax.lax.bitcast_convert_type(jnp.asarray(raw2), jnp.float8_e4m3fn)
+    weights = _weights(9)
+    offsets = np.zeros(seqs, np.int32)
+    codes = np.zeros(seqs, np.int32)
+    pending = {}  # sequence -> committed 4-slot block bytes awaiting a replay
+    for t in range(6):
+        lens = np.array([spec["lens"](t, s) for s in range(seqs)])
+        dist = (windowed, live, live)
+        step = _step(40 + t, 3, lens, dist, num_tokens=int(lens.sum()))
+        step4 = dict(step, ckpt_indices=jnp.asarray(ckpt4, jnp.int32))
+        step4["read_offsets"] = jnp.asarray(offsets)
+        step2 = dict(step, ckpt_indices=jnp.asarray(ckpt2, jnp.int32))
+        step2["read_offsets"] = jnp.asarray(codes)
+        pool4, out4 = _pooled_call(pool4, step4, weights)
+        pool2, out2 = _pooled_call(pool2, dict(step2, two_slot_ckpts=True), weights)
+        _assert_same(out2, out4, f"{schedule} step {t} outputs")
+        for s, want in pending.items():
+            if lens[s] == 1:
+                # A one-token window commits to block 0 (checked below).
+                continue
+            # The start state a replay rebuilt is the committed checkpoint.
+            got = _block_bytes(pool2, ckpt2[s, codes[s] & 1], half_last=True)
+            np.testing.assert_array_equal(got, want, err_msg=f"{schedule} {t} s{s}")
+        pending = {}
+        for s in range(live):
+            drafts = int(lens[s]) - 1 if s < windowed else 0
+            accepted = (s + t) % (drafts + 1)
+            if drafts == 0:
+                committed, nxt = ckpt4[s, 0], 0
+                last = ckpt2[s, 0]
+            elif accepted == drafts:
+                committed, nxt = ckpt4[s, accepted], 1 - (codes[s] & 1)
+                last = ckpt2[s, nxt]
+            else:
+                committed, nxt = ckpt4[s, accepted], (codes[s] & 1) + 2 * (accepted + 1)
+                last = None
+            if last is None:
+                pending[s] = _block_bytes(pool4, committed, half_last=True)
+            else:
+                np.testing.assert_array_equal(
+                    _block_bytes(pool2, last),
+                    _block_bytes(pool4, committed),
+                    err_msg=f"{schedule} step {t} s{s} last state",
+                )
+            offsets[s] = accepted if drafts else 0
+            codes[s] = nxt

@@ -35,7 +35,20 @@ Every element sees the same operations in the same order as in
 `inner_kernel` (the conv's tap sum, SiLU, per-row masks, L2 norms and
 gates, per-head dots, which `recurrent_gdn` batches over heads), so outputs
 and every checkpoint byte are bitwise equal.
+
+With two-slot checkpoints (`GDNConfig.two_slot_ckpts`) a sequence keeps
+only the window's start state and the state after its last real token. A
+partially accepted window leaves its accepted tokens pending; the next
+window first recomputes them from the start state (`replay`: the same
+per-token arithmetic, no outputs, no checkpoints) and writes the result
+back to the read tile in the state's storage dtype, which is exactly the
+state a checkpoint store and reload would have given the window. The
+tokens to recompute come from the start tile's conv block, where each
+window stores its first `window_size - 1` tokens' conv inputs and b / a
+rows past the conv state.
 """
+
+import math
 
 import jax
 import jax.numpy as jnp
@@ -102,9 +115,34 @@ def supported(cfg: config.GDNConfig, block_shape: tuple[int, ...], block_dtype) 
         or _stored_rows(cfg) == ()
     ):
         return False
+    if cfg.two_slot_ckpts and _window_rows_base(cfg) + _window_rows(
+        cfg
+    ) > _conv_view_rows(block_shape, block_dtype):
+        return False
     return plan.recurrent.view_dtype == jnp.uint32 and vmem_ldst.supports_head_states(
         block_shape, block_dtype, cfg
     )
+
+
+def _conv_view_rows(block_shape: tuple[int, ...], block_dtype) -> int:
+    """Typed BF16 rows of one conv tile (one whole source block)."""
+    nbytes = math.prod(block_shape) * jnp.dtype(block_dtype).itemsize
+    return nbytes // (_lanes() * jnp.dtype(jnp.bfloat16).itemsize)
+
+
+def _window_rows_base(cfg: config.GDNConfig) -> int:
+    """First typed row past a conv checkpoint's state and zero padding:
+    where two-slot checkpoints keep a window's tokens."""
+    used = cfg.prev_kernel_size * cfg.dim_size // _lanes()
+    return -(-used // 16) * 16
+
+
+def _window_rows(cfg: config.GDNConfig) -> int:
+    """Typed rows (whole packed BF16 registers) of the tokens a two-slot
+    start tile keeps: the conv inputs of the window's first
+    `window_size - 1` tokens, then their b and a rows."""
+    rows = (cfg.window_size - 1) * (cfg.dim_size // _lanes() + 2)
+    return -(-rows // 16) * 16
 
 
 def _conv_view(slot_ref: jax.Ref) -> jax.Ref:
@@ -152,6 +190,37 @@ def _store_conv_ckpt(slot_ref: jax.Ref, cfg: config.GDNConfig, taps) -> None:
         )
 
 
+def _store_conv_start(
+    slot_ref: jax.Ref, cfg: config.GDNConfig, taps, tokens, gates
+) -> None:
+    """Stores a two-slot start tile's conv block: the start state's taps
+    as `_store_conv_ckpt` does, then the conv inputs (stored row order) of
+    each window token that may have to be recomputed, then their b and a
+    rows, then zeros. Every value came from BF16, so the BF16 store is
+    exact."""
+    view = _conv_view(slot_ref)
+    lanes = _lanes()
+    base = _window_rows_base(cfg)
+    used = cfg.prev_kernel_size * cfg.dim_size // lanes
+    blocks = list(taps)
+    if base > used:
+        blocks.append(jnp.zeros((base - used, lanes), jnp.float32))
+    blocks.extend(tokens)
+    for gate in gates:
+        blocks.extend(gate)
+    data = jnp.concat(blocks, axis=0)
+    end = -(-data.shape[0] // 16) * 16
+    if end > data.shape[0]:
+        data = jnp.concat(
+            [data, jnp.zeros((end - data.shape[0], lanes), jnp.float32)], axis=0
+        )
+    view[pl.ds(0, end)] = data.astype(jnp.bfloat16)
+    if end < view.shape[0]:
+        view[pl.ds(end, view.shape[0] - end)] = jnp.zeros(
+            (view.shape[0] - end, view.shape[1]), jnp.bfloat16
+        )
+
+
 def run(
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] FP32
     b_slot_ref: jax.Ref,  # [seq, chunk, 1, lanes]
@@ -159,13 +228,18 @@ def run(
     conv_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     rec_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head_dim]
-    conv_out_ref: jax.Ref,  # [seq, window, nblocks, *block]
-    rec_out_ref: jax.Ref,  # [seq, window, nblocks, *block]
+    conv_out_ref: jax.Ref,  # [seq, window (two-slot: 2), nblocks, *block]
+    rec_out_ref: jax.Ref,  # [seq, window (two-slot: 2), nblocks, *block]
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
     state_ref: jax.Ref,  # [seq, num_v_heads, kq_head_dim, v_head_dim] FP32
     lhs_ref: jax.Ref,  # [seq, chunk + prev_kernel_size, dim_size / 128, 128] FP32
     conv_w_ref: jax.Ref,  # [kernel_size + 1, dim_size / 128, 128] FP32
+    # Two-slot checkpoints only: the previous window's conv inputs after the
+    # start taps [seq, prev_kernel_size + window - 1, dim_size / 128, 128] and
+    # its b / a rows [seq, window - 1, 2, 128], FP32.
+    rep_ref: jax.Ref | None = None,
+    rep_gate_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array,
@@ -183,6 +257,16 @@ def run(
         metadata_ref.s_idx_has_initial_state[metadata_ref.p_id_to_s_idx[p_id, idx]]
         for idx in seqs
     ]
+    two = cfg.two_slot_ckpts
+    num_replay = cfg.window_size - 1
+    if two:
+        assert rep_ref is not None and rep_gate_ref is not None
+        replays = [
+            memory_ref.two_slot_read(
+                metadata_ref, metadata_ref.p_id_to_s_idx[p_id, idx], real_sizes[idx]
+            )[1]
+            for idx in seqs
+        ]
 
     # Conv inputs per sequence, dense and in the pool's stored row order: the
     # previous taps (zero for a fresh sequence), then the window's tokens.
@@ -193,8 +277,20 @@ def run(
         prev_taps = jnp.where(
             has_initial_state[idx], _load_conv_taps(conv_in_ref.at[idx, 0], cfg), 0
         )
+        # Two-slot: the start taps head the previous window's tokens, which
+        # the start tile stored past its conv state; the window's own taps
+        # are copied in once the replay has advanced past those tokens.
+        tap_ref = rep_ref if two else lhs_ref
         for tap in range(prev):
-            lhs_ref[idx, tap] = prev_taps[tap * rows : (tap + 1) * rows]
+            tap_ref[idx, tap] = prev_taps[tap * rows : (tap + 1) * rows]
+        if two:
+            stored = _conv_view(conv_in_ref.at[idx, 0])[
+                pl.ds(_window_rows_base(cfg), _window_rows(cfg))
+            ].astype(jnp.float32)
+            gate0 = num_replay * rows
+            for j in range(num_replay):
+                rep_ref[idx, prev + j] = stored[j * rows : (j + 1) * rows]
+                rep_gate_ref[idx, j] = stored[gate0 + 2 * j : gate0 + 2 * j + 2]
         tokens = qkv_slot_ref.at[idx].reshape(-1, lanes)
         for t in range(cfg.chunk_size):
             lhs_ref[idx, prev + t] = _to_stored(tokens[pl.ds(t * rows, rows)], cfg)
@@ -225,6 +321,44 @@ def run(
         )
         return picked[0, head : head + 1]
 
+    def replay(j, idx):
+        # Token j of the previous window, recomputed from the start state
+        # with the arithmetic `position` gave it: state only.
+        act = jnp.zeros((rows, lanes), jnp.float32)
+        for k in range(ks):
+            act += rep_ref[idx, j + k] * conv_w_ref[k]
+        if weights_ref.conv.bias is not None:
+            act += conv_w_ref[ks]
+        act = jax.nn.silu(act)
+        gates = rep_gate_ref[idx, j]
+        beta = jax.nn.sigmoid(gates[0:1].astype(compute))
+        gating = jnp.exp(neg_a * jax.nn.softplus(gates[1:2].astype(compute) + dt_bias))
+        for kq_head in range(nkq):
+            r = stored_row[nkq + kq_head]
+            k = compute_gdn.l2_norm(act[r : r + 1].astype(compute))
+            k_t = compute_gdn.fused_transpose_broadcast(k, src_dim=1, dst_dim=0)
+            for head in range(
+                kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
+            ):
+                v = act[2 * nkq + head : 2 * nkq + head + 1].astype(compute)
+                if j == 0:
+                    state = vmem_ldst.load_state_head(rec_in_ref, cfg, idx, head)
+                else:
+                    state = state_ref[idx, head]
+                state_updated = state * head_scalar(gating, head)
+                v_updated = jax.lax.dot(
+                    k[None],
+                    state_updated[None],
+                    dimension_numbers=batched_dims,
+                    preferred_element_type=jnp.float32,
+                )[0].astype(compute)
+                v_new = head_scalar(beta, head) * (v - v_updated)
+                state = state_updated + k_t * v_new
+                state_ref[idx, head] = state
+                # The window starts from the read tile, so leave the state
+                # there as a checkpoint store would.
+                vmem_ldst.store_state_head(rec_in_ref, cfg, idx, 0, head, state)
+
     def position(pos, first):
         for idx in seqs:
             real_size = real_sizes[idx]
@@ -240,14 +374,17 @@ def run(
 
             # Conv checkpoint `pos`: the inputs ending at the window's
             # position `pos`, or at the last real token if that is earlier.
-            start = jnp.where(
-                jnp.logical_and(real_size >= 1, real_size <= pos), real_size, pos + 1
-            )
-            _store_conv_ckpt(
-                conv_out_ref.at[idx, pos],
-                cfg,
-                [lhs_ref[idx, start + j] for j in range(prev)],
-            )
+            if not two:
+                start = jnp.where(
+                    jnp.logical_and(real_size >= 1, real_size <= pos),
+                    real_size,
+                    pos + 1,
+                )
+                _store_conv_ckpt(
+                    conv_out_ref.at[idx, pos],
+                    cfg,
+                    [lhs_ref[idx, start + j] for j in range(prev)],
+                )
 
             beta = jnp.where(
                 valid, jax.nn.sigmoid(b_slot_ref[idx, pos].astype(compute)), 0
@@ -280,6 +417,11 @@ def run(
                             vmem_ldst.load_state_head(rec_in_ref, cfg, idx, head),
                             0,
                         )
+                        if two:
+                            # The start tile.
+                            vmem_ldst.store_state_head(
+                                rec_out_ref, cfg, idx, 0, head, state
+                            )
                     else:
                         state = state_ref[idx, head]
                     state_updated = state * head_scalar(gating, head)
@@ -290,22 +432,60 @@ def run(
                         preferred_element_type=jnp.float32,
                     )[0].astype(compute)
                     v_new = head_scalar(beta, head) * (v - v_updated)
-                    state = state_updated + k_t * v_new
+                    updated = state_updated + k_t * v_new
                     out = jax.lax.dot(
                         q[None],
-                        state[None],
+                        updated[None],
                         dimension_numbers=batched_dims,
                         preferred_element_type=jnp.float32,
                     )[0].astype(compute)
                     out_rows.append(out)
-                    state_ref[idx, head] = state
-                    vmem_ldst.store_state_head(rec_out_ref, cfg, idx, pos, head, state)
+                    if two:
+                        # Past the last real token the state stays put, so
+                        # the window's last position holds the last state.
+                        updated = jnp.where(valid, updated, state)
+                        state_ref[idx, head] = updated
+                        if pos == cfg.chunk_size - 1:
+                            vmem_ldst.store_state_head(
+                                rec_out_ref, cfg, idx, 1, head, updated
+                            )
+                    else:
+                        state_ref[idx, head] = updated
+                        vmem_ldst.store_state_head(
+                            rec_out_ref, cfg, idx, pos, head, updated
+                        )
             out_slot_ref[idx, pos] = jnp.concat(out_rows, axis=0).astype(
                 out_slot_ref.dtype
             )
 
+    if two:
+        # Only sequences with tokens left to recompute run a replay
+        # position; the heads of one sequence keep the MXU busy.
+        for j in range(num_replay):
+            for idx in seqs:
+                pl.when(j < replays[idx])(lambda j=j, idx=idx: replay(j, idx))
+        for idx in seqs:
+            for tap in range(prev):
+                lhs_ref[idx, tap] = rep_ref[idx, replays[idx] + tap]
     for pos in range(cfg.chunk_size):
         position(pos, first=pos == 0)
+    if two:
+        for idx in seqs:
+            # Inputs ending at the last real token, as conv checkpoint
+            # `real_size - 1` holds them.
+            last = jnp.maximum(real_sizes[idx], 1)
+            _store_conv_ckpt(
+                conv_out_ref.at[idx, 1],
+                cfg,
+                [lhs_ref[idx, last + j] for j in range(prev)],
+            )
+            _store_conv_start(
+                conv_out_ref.at[idx, 0],
+                cfg,
+                [lhs_ref[idx, j] for j in range(prev)],
+                [lhs_ref[idx, prev + t] for t in range(num_replay)],
+                [(b_slot_ref[idx, t], a_slot_ref[idx, t]) for t in range(num_replay)],
+            )
     for idx in seqs:
-        for t in range(cfg.window_size):
+        for t in range(cfg.num_ckpt_tiles):
             vmem_ldst.zero_state_padding(rec_out_ref, cfg, idx, t)
