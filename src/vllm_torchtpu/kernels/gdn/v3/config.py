@@ -122,6 +122,23 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Speculative decoding with two state blocks per sequence instead of
+    # `window_size`: block 0 of `ckpt_indices[s]` or block 1, picked by the
+    # low bit of the read offset, holds the verify window's start state, and
+    # the other receives the state after the window's last real token. The
+    # offset's remaining bits count the tokens of the previous window that
+    # were accepted but not yet folded into the start state; the window tile
+    # recomputes them (outputs and checkpoints skipped) before the window.
+    # The tokens of each window ride in the start block's conv tile, past the
+    # conv state. See `window_tile` and `memory_ref.ExternalStateBufferedRef`.
+    two_slot_ckpts: bool = False
+
+    @property
+    def num_ckpt_tiles(self) -> int:
+        """State tiles per sequence in a tile's checkpoint buffer."""
+        if self.two_slot_ckpts and self.mode == GDNMode.BATCHED:
+            return 2
+        return self.window_size
 
     @property
     def chunk_size(self) -> int:
@@ -205,6 +222,8 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.num_ckpt_tiles == 2 and self.window_size > 2:
+            suffix += "_2slot"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
@@ -300,6 +319,24 @@ class GDNConfig:
                     jnp.float32,
                 ),
             )
+            if self.two_slot_ckpts:
+                # The previous window's conv inputs after the start state's
+                # taps, and its b / a rows.
+                window_scratches += (
+                    pltpu.VMEM(
+                        (
+                            self.seq_tile_size,
+                            self.prev_kernel_size + self.window_size - 1,
+                            pl.cdiv(self.dim_size, num_lanes),
+                            num_lanes,
+                        ),
+                        jnp.float32,
+                    ),
+                    pltpu.VMEM(
+                        (self.seq_tile_size, self.window_size - 1, 2, num_lanes),
+                        jnp.float32,
+                    ),
+                )
 
         return dict(
             carry_conv_scratch_ref=carry_conv_scratch,

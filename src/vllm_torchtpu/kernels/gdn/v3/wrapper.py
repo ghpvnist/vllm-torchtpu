@@ -464,6 +464,7 @@ def windowed_decode_tile_size(
         "state_plan",
         "attention_mode",
         "gate_lower_bound",
+        "two_slot_ckpts",
     ),
 )
 def fused_conv1d_gdn(
@@ -500,6 +501,7 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    two_slot_ckpts: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -571,6 +573,11 @@ def fused_conv1d_gdn(
         decode_tile_size: Tile size along sequence dimension for decode sequences.
         mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
             sequences.
+        two_slot_ckpts: Speculative decoding with two state blocks per
+            sequence (`ckpt_indices` is [num_seqs, 2]) instead of one per
+            window position; `read_offsets` then packs the start block and
+            the number of tokens to recompute (`GDNConfig.two_slot_ckpts`).
+            Needs the pooled source and BF16 activations.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -595,6 +602,14 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
+    if two_slot_ckpts:
+        # The start tile keeps each window's inputs, which only round-trip
+        # through its BF16 rows exactly when they arrive as BF16.
+        assert qkv.dtype == b.dtype == a.dtype == jnp.bfloat16, (
+            qkv.dtype,
+            b.dtype,
+            a.dtype,
+        )
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
@@ -634,11 +649,16 @@ def fused_conv1d_gdn(
         read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
     assert read_offsets.shape == (num_seqs,)
     read_offsets = read_offsets.astype(jnp.int32)
+    if two_slot_ckpts:
+        assert pooled and num_spec_tokens > 0, (
+            "two-slot checkpoints need a pooled state source and drafts"
+        )
     if ckpt_indices is not None:
         # One source block per checkpoint (vLLM's ssm_state_indices scheme):
         # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
         # the pool block only ever has to hold a single state.
-        assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1), (
+        num_ckpts = 2 if two_slot_ckpts else num_spec_tokens + 1
+        assert ckpt_indices.shape == (num_seqs, num_ckpts), (
             ckpt_indices.shape,
             num_seqs,
             num_spec_tokens,
@@ -758,6 +778,7 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            two_slot_ckpts=two_slot_ckpts,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,
@@ -795,6 +816,11 @@ def fused_conv1d_gdn(
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+        if two_slot_ckpts and mode == config.GDNMode.BATCHED:
+            # Only the window tile recomputes accepted tokens.
+            assert window_tile.supported(
+                cfg, in_conv_state.shape[1:], in_conv_state.dtype
+            ), "two-slot checkpoints need window_tile support for this pool"
 
         # Step 7: Handle case where write needs to be done in existing out.
         # Flat aliasing indices account for the absent recurrent-state

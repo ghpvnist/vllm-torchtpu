@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_TP4_HIER_ALL_REDUCE_BLOCKS: int = 4
     TPU_TP4_HIER_ALL_REDUCE_MAX_ROWS: int = 256
     TPU_CANDIDATE_SAMPLING: bool = True
+    TPU_GDN_TWO_SLOT_CKPT: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -783,6 +784,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gathered logits (layers/core/candidate_sampling.py). Same
     # distributions; 0 samples from the all-gathered logits.
     "TPU_CANDIDATE_SAMPLING": env_bool("TPU_CANDIDATE_SAMPLING", default=True),
+    # Speculative decoding on the unified pool: keep two GDN state blocks per
+    # request (the verify window's start state and its last state) instead of
+    # one per window position; a partially accepted window is recomputed from
+    # the start state at the next step (kernels/gdn/v3/window_tile.py). Same
+    # outputs, num_speculative_tokens - 1 fewer blocks per GDN group.
+    "TPU_GDN_TWO_SLOT_CKPT": env_bool("TPU_GDN_TWO_SLOT_CKPT", default=False),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),

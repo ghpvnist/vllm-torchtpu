@@ -125,6 +125,20 @@ class MetadataRef:
         return len(jax.tree_util.tree_leaves(self))
 
 
+def two_slot_read(metadata_ref: MetadataRef, s_idx, r_size):
+    """(start block, tokens to recompute) of a sequence under two-slot
+    checkpoints (`GDNConfig.two_slot_ckpts`).
+
+    The read offset packs both: its low bit names the block of the
+    sequence's pair holding the start state, the rest counts the leading
+    tokens of the previous window that were accepted but are not in that
+    state yet. Sequences that read no state recompute nothing.
+    """
+    code = metadata_ref.s_idx_to_read_offset[s_idx]
+    reads = jnp.logical_and(metadata_ref.s_idx_has_initial_state[s_idx], r_size > 0)
+    return code & 1, jnp.where(reads, code >> 1, 0)
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BaseBufferedRef(pltpu.BufferedRef):
     cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
@@ -454,6 +468,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
     compact_output_ref: Any | None = dataclasses.field(
         default=None, metadata=dict(static=True)
     )
+    # Two-slot checkpoints: whether this region's start-state tile is written
+    # back on every verify window (the conv region, which also carries the
+    # window's tokens) or only when tokens were recomputed into it.
+    start_always: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
     def _ckpt_state_idx(self, s_idx, ckpt):
         """Source block holding checkpoint `ckpt` of sequence `s_idx`.
@@ -496,6 +514,8 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
             # Resume from the checkpoint of the last accepted token.
             read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+            if self.cfg.two_slot_ckpts:
+                read_ckpt = read_ckpt & 1
             state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
 
             pltpu.make_async_copy(
@@ -535,9 +555,52 @@ class ExternalStateBufferedRef(StateBufferedRef):
                 sem,
             ).start()
 
+    def _two_slot_writes(self, p_id, idx):
+        """Two-slot write-back of one sequence: ((tile, block, write), ...).
+
+        A verify window writes the state after its last real token to the
+        pair's other block and, when the start tile changed, the start
+        state back to the start block. A one-token window commits: its
+        state goes to block 0 and the start block is not written.
+        """
+        is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
+        s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+        r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+        slot, replay = two_slot_read(self.metadata_ref, s_idx, r_size)
+        verify = r_size >= 2
+        live = jnp.logical_and(is_last_tile, r_size >= 1)
+        last_ckpt = jnp.where(verify, 1 - slot, 0)
+        write_start = jnp.logical_and(
+            jnp.logical_and(live, verify),
+            jnp.logical_or(self.start_always, replay > 0),
+        )
+        return (
+            (1, self._ckpt_state_idx(s_idx, last_ckpt), live),
+            (0, self._ckpt_state_idx(s_idx, slot), write_start),
+        )
+
+    def _two_slot_tiles(self) -> bool:
+        return self.cfg.two_slot_ckpts and self.cfg.num_ckpt_tiles == 2
+
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
             return self._copy_out_compact(grid_indices)
+        if self._two_slot_tiles():
+            assert self.sem_sends is not None
+            assert self.window_ref is not None
+            slot = self.current_copy_out_slot
+            sem = self.sem_sends.at[slot]
+            vmem_ref = self.window_ref.at[slot]
+            p_id = grid_indices[0]
+            for idx in range(self.cfg.seq_tile_size):
+                for tile, state_idx, write in self._two_slot_writes(p_id, idx):
+                    nblocks = jnp.where(write, self.region.nblocks, 0)
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, tile, pl.ds(0, nblocks)],
+                        self._region_slice(dst_ref, state_idx, nblocks),
+                        sem,
+                    ).start()
+            return None
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
@@ -599,6 +662,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
         dma_size = 0
         for idx in range(self.cfg.seq_tile_size):
+            if self._two_slot_tiles():
+                for _, _, write in self._two_slot_writes(p_id, idx):
+                    dma_size += jnp.where(write, 1, 0)
+                continue
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
@@ -732,14 +799,14 @@ def create_allocs(
         # without speculative decoding, where window_size is 1).
         conv_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.num_ckpt_tiles,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
         )
         recurrent_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.num_ckpt_tiles,
             cfg.num_v_heads,
             cfg.kq_head_dim,
             cfg.v_head_dim,
@@ -777,13 +844,13 @@ def create_allocs(
             # Whole-block DMA transfers complete pages, retaining all inner dims.
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.num_ckpt_tiles,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.num_ckpt_tiles,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
@@ -791,14 +858,14 @@ def create_allocs(
             payload = conv_state_ref.shape[2:]
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.num_ckpt_tiles,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.num_ckpt_tiles,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,
@@ -820,6 +887,7 @@ def create_allocs(
                 state_kwargs,
                 region=plan.conv,
                 compact_output_ref=conv_state_output_ref,
+                start_always=cfg.two_slot_ckpts,
             ),
         )
         recurrent_alloc = _state_allocs(
