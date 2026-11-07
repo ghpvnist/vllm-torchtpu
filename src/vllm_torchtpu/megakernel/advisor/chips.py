@@ -202,7 +202,7 @@ BUILTIN_CHIP_SPECS: Mapping[str, ChipSpec] = {
         hbm_bw_bytes_per_s=3_700_000_000_000.0,
         bf16_flops_per_s=1_155_000_000_000_000.0,
         fp8_flops_per_s=2_300_000_000_000_000.0,
-        int8_flops_per_s=1_155_000_000_000_000.0,
+        int8_flops_per_s=2_310_000_000_000_000.0,
         native_ocp_fp8=True,
         ici_egress_bw_bytes_per_s=300.0e9,
         ici_link_bw_bytes_per_s=100.0e9,
@@ -328,8 +328,12 @@ def load_chip_spec_file(
     )
     bf16_flops = float(raw["bf16_flops_per_s"])
     fp8_flops = float(raw.get("fp8_flops_per_s", bf16_flops))
-    int8_flops = float(raw.get("int8_flops_per_s", bf16_flops))
     native_fp8 = bool(raw.get("native_ocp_fp8", fp8_flops > bf16_flops))
+    raw_int8 = raw.get("int8_flops_per_s")
+    int8_val = float(str(raw_int8)) if raw_int8 is not None else 0.0
+    int8_flops = (
+        int8_val if int8_val > 0.0 else ((2.0 if native_fp8 else 1.0) * bf16_flops)
+    )
     bracket_raw = raw.get("collective_latency_us_bracket")
     if type(bracket_raw) is list and len(bracket_raw) == _BRACKET_LEN:
         bracket = (float(bracket_raw[0]), float(bracket_raw[1]))
@@ -423,6 +427,7 @@ def _scale_megacore(
         fp8_flops_per_s=base.fp8_flops_per_s * num_cores,
         int8_flops_per_s=base.int8_flops_per_s * num_cores,
         ici_egress_bw_bytes_per_s=egress,
+        ici_link_bw_bytes_per_s=base.ici_link_bw_bytes_per_s * num_cores,
         collective_latency_s=lat_s,
         collective_latency_us_bracket=bracket,
     )

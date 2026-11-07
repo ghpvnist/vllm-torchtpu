@@ -29,6 +29,7 @@
       "top_k": 10,
       "moe_intermediate_size": 1024,
       "shared_expert_intermediate_size": 1024,
+      "has_attn_output_gate": true,
       "weight_dtype": "fp8",
       "model_type": "qwen3_5_moe",
       "source": "HuggingFace Qwen/Qwen3.5-397B-A17B-FP8 config.json"

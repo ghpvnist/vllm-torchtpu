@@ -26,6 +26,7 @@ from .. import errors
 from ..advisor.models import resolve_model_profile
 from . import (
     DEPLOYMENT_PRESETS,
+    DispatchRegime,
     MoEMode,
     ObjectiveMode,
     Phase,
@@ -114,6 +115,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--moe-mode", choices=get_args(MoEMode), default="masked_on_chip"
     )
     parser.add_argument("--objective", choices=get_args(ObjectiveMode), default="step")
+    parser.add_argument(
+        "--dispatch-regime",
+        choices=get_args(DispatchRegime),
+        default="auto",
+    )
     parser.add_argument(
         "--layer-groups",
         type=str,
@@ -220,6 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             deployment_preset=args.deployment_preset,
             measurements=args.measurements,
             objective=args.objective,
+            dispatch_regime=args.dispatch_regime,
         )
         if args.html:
             write_advisor_html(sweep, args.html)

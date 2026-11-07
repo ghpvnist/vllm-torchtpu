@@ -71,18 +71,33 @@ Phase = Literal["decode", "verify", "prefill", "mixed"]
 MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
 ProvenanceTag = Literal["DERIVED", "ASSUMED", "MEASURED"]
 ObjectiveMode = Literal["step", "throughput", "both"]
+DispatchRegime = Literal["auto", "zero_floor", "compiled_xla", "unfused_eager"]
 
 _MIN_VMEM_MIB = 2
 _DEFAULT_USABLE_VMEM_MIB = 62
 _DOUBLE_BUFFER_SLOTS = 2
 _VALID_DMA_BUFFERS = (2, 3)
+_WIDE_DENSE_RING_SLOTS = 14
+_WIDE_EXPERT_RING_SLOTS = 10
+_DENSE_SLOT_DEFAULT_BYTES = 2 << 20
+_EXPERT_SLOT_DEFAULT_BYTES = 1 << 20
+_ARENA_ALIGN_RESERVE_BYTES = 2 << 20
+_ATTN_TILE_TOKENS = 128
+_GDN_STREAMED_HEADS_CAP = 8
+_DENSE_FFN_TILE_CAP = 1024
+_FP32_BYTES = 4
 _GROUPED_MOE_MODES = frozenset({"grouped_on_chip"})
 _DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
 _DEFAULT_LAUNCH_GAP_VAL_US = 2.0
 _DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
+_COMPILED_XLA_GAP_P50_US = 0.8724
+_COMPILED_XLA_GAP_P90_US = 1.0990
+_COMPILED_XLA_SAMPLE_COUNT = 3
+_UNFUSED_EAGER_GAP_US = 6.0
 _MEASUREMENTS_SCHEMA = "advisor.measurements.v1"
 _CHIPS_PER_HOST: int = 8
 _COLLECTIVE_RING_THRESHOLD_BYTES: int = 16 * 1024
+_DEFAULT_DCN_EGRESS_BW_BYTES_PER_S: float = 12_500_000_000.0
 _DEFAULT_DCN_HOP_LATENCY_S: float = 5.0e-6
 
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
@@ -118,8 +133,8 @@ class RingPlan:
     dense_slots: int = 2
     expert_slots: int = 2
     dense_slot_bytes: int = 2 << 20
-    expert_slot_bytes: int = 2 << 20
-    compiler_spill_reserve_bytes: int = 6 << 20
+    expert_slot_bytes: int = 1 << 20
+    compiler_spill_reserve_bytes: int = 0
 
 
 def default_double_buffer_ring_plan(dma_buffers: int = 2) -> RingPlan:
@@ -166,10 +181,8 @@ def _parse_ring_plan(rp_raw: object) -> RingPlan | None:
         dense_slots=int(rp_raw.get("dense_slots", 2)),
         expert_slots=int(rp_raw.get("expert_slots", 2)),
         dense_slot_bytes=int(rp_raw.get("dense_slot_bytes", 2 << 20)),
-        expert_slot_bytes=int(rp_raw.get("expert_slot_bytes", 2 << 20)),
-        compiler_spill_reserve_bytes=int(
-            rp_raw.get("compiler_spill_reserve_bytes", 6 << 20)
-        ),
+        expert_slot_bytes=int(rp_raw.get("expert_slot_bytes", 1 << 20)),
+        compiler_spill_reserve_bytes=int(rp_raw.get("compiler_spill_reserve_bytes", 0)),
     )
 
 
@@ -242,6 +255,16 @@ def load_measurements(
 
 
 @dataclass(frozen=True)
+class EfficiencySpec:
+    """Achievable unit utilization factors relative to peak hardware rates."""
+
+    eta_hbm: float = 0.82
+    eta_dense: float = 0.72
+    eta_moe_grouped: float = 0.50
+    eta_ici: float = 0.75
+
+
+@dataclass(frozen=True)
 class WorkloadSpec:
     """Serving request geometry, VMEM budget, and multi-buffering configuration."""
 
@@ -274,6 +297,9 @@ class WorkloadSpec:
     dma_buffers: int = 2
     ring_plan: RingPlan | None = None
     objective: ObjectiveMode = "step"
+    hbm_utilization_cap: float = 0.80
+    dispatch_regime: DispatchRegime = "auto"
+    efficiency: EfficiencySpec = EfficiencySpec()
 
 
 @dataclass(frozen=True)
@@ -293,6 +319,9 @@ class ScopeEstimate:
     moe_flop_factor: float
     roof_floor_us: float
     step_bound_us: float
+    selected_nbd: int = 0
+    selected_nbe: int = 0
+    step_achievable_us: float = 0.0
     break_even_op_overhead_us: float = 0.0
     step_upper_us: float = 0.0
 
@@ -713,18 +742,142 @@ def _validate_advise_inputs(
     return bw_w, bw_e, bw_kv, bw_st
 
 
+def _mesh_divisibility_reasons(prof: ModelProfile, workload: WorkloadSpec) -> list[str]:
+    """Return non-raising sharding divisibility violation codes."""
+    reasons: list[str] = []
+    tp, pp, dp, ep = workload.tp, workload.pp, workload.dp, workload.ep
+    kv_split, dcp, pcp = workload.kv_split, workload.dcp, workload.pcp
+    eff_tp = max(tp, dcp) if tp == 1 else tp
+    if (eff_tp & (eff_tp - 1)) != 0:
+        reasons.append("tp_not_power_of_two")
+    if prof.num_attention_heads % eff_tp != 0:
+        reasons.append("attn_heads_not_divisible_by_tp")
+    kv_tp = max(1, eff_tp // max(1, kv_split))
+    if eff_tp % kv_split != 0 or (
+        prof.num_kv_heads % kv_tp != 0 and kv_tp % prof.num_kv_heads != 0
+    ):
+        reasons.append("kv_heads_not_divisible_by_tp")
+    if eff_tp % dcp != 0:
+        reasons.append("dcp_not_dividing_tp")
+    if prof.num_experts > 0 and (
+        prof.num_experts % ep != 0 or not (1 <= prof.top_k <= prof.num_experts)
+    ):
+        reasons.append("experts_not_divisible_by_ep")
+    if (eff_tp * dp * pcp) % ep != 0:
+        reasons.append("ep_exceeds_slice_ranks")
+    if pp > prof.num_layers:
+        reasons.append("pp_exceeds_layers")
+    return reasons
+
+
+def validate_workload(
+    profile: ModelProfile | str | Mapping[str, object],
+    chip: ChipSpec | str,
+    workload: WorkloadSpec,
+) -> tuple[str, ...]:
+    """Validate sharding divisibility and serving HBM pool fit without raising."""
+    prof = resolve_model_profile(profile)
+    chip_spec = resolve_chip_spec(chip)
+    pos_vals = (
+        prof.num_layers,
+        prof.hidden_size,
+        prof.num_attention_heads,
+        prof.head_dim,
+        workload.batch,
+        workload.tp,
+        workload.pp,
+        workload.dp,
+        workload.ep,
+        workload.kv_split,
+        workload.dcp,
+        workload.pcp,
+        workload.isl,
+    )
+    nonneg_vals = (
+        workload.osl,
+        workload.context,
+        workload.spec_tokens,
+        workload.chunk_size,
+        workload.microbatches,
+        workload.segment_layers,
+    )
+    if min(*pos_vals) < 1 or min(*nonneg_vals) < 0 or workload.op_overhead_us < 0.0:
+        return ("invalid_dimensions",)
+    reasons = _mesh_divisibility_reasons(prof, workload)
+    dtypes = (
+        prof.weight_dtype,
+        prof.expert_dtype,
+        prof.kv_dtype,
+        prof.state_dtype,
+    )
+    dtypes_bw = tuple(_DTYPE_BYTES.get(d.lower(), 1.0) for d in dtypes)
+    ctx = _build_scope_context(prof, workload, chip_spec, dtypes_bw, plan_error="")
+    if ctx.hbm_used > workload.hbm_utilization_cap * chip_spec.hbm_capacity_bytes:
+        reasons.append("hbm_pool_overflow")
+    return tuple(reasons)
+
+
+def _select_adaptive_ring(
+    ctx: _ScopeContext,
+    workload: WorkloadSpec,
+    fixed_non_ring_bytes: int,
+) -> tuple[int, int, int, int]:
+    """Select widest (nbd, nbe) fitting active_tokens in VMEM before splitting."""
+    has_moe = ctx.l_moe > 0
+    if workload.tiles is not None:
+        nbd = workload.tiles.nbd
+        nbe = workload.tiles.nbe if has_moe else 0
+        ring_b = nbd * workload.tiles.bank + nbe * workload.tiles.ebank
+        return nbd, nbe, ring_b, ring_b
+    if workload.ring_plan is not None:
+        rp = workload.ring_plan
+        nbd = rp.dense_slots
+        nbe = rp.expert_slots if has_moe else 0
+        ring_b = nbd * rp.dense_slot_bytes + nbe * rp.expert_slot_bytes
+        return nbd, nbe, ring_b, ring_b
+    min_nbd = workload.dma_buffers
+    extra = min_nbd - _DOUBLE_BUFFER_SLOTS
+    max_nbd = _WIDE_DENSE_RING_SLOTS + extra
+    min_nbe = min_nbd if has_moe else 0
+    max_nbe = (_WIDE_EXPERT_RING_SLOTS + extra) if has_moe else 0
+    min_ring_b = (
+        min_nbd * _DENSE_SLOT_DEFAULT_BYTES + min_nbe * _EXPERT_SLOT_DEFAULT_BYTES
+    )
+    avail = (
+        ctx.vmem_budget
+        - fixed_non_ring_bytes
+        - ctx.per_token_fused_bytes * ctx.active_tokens
+    )
+    if avail < min_ring_b:
+        return min_nbd, min_nbe, min_ring_b, min_ring_b
+    best_key = (-1, -1, -1)
+    best_choice = (min_nbd, min_nbe, min_ring_b)
+    for nbd in range(min_nbd, max_nbd + 1):
+        for nbe in range(min_nbe, max_nbe + 1):
+            ring_b = nbd * _DENSE_SLOT_DEFAULT_BYTES + nbe * _EXPERT_SLOT_DEFAULT_BYTES
+            if ring_b <= avail:
+                bal = (
+                    (nbd - min_nbd)
+                    if not has_moe
+                    else min(nbd - min_nbd, nbe - min_nbe)
+                )
+                cand_key = (ring_b, bal, nbd)
+                if cand_key > best_key:
+                    best_key = cand_key
+                    best_choice = (nbd, nbe, ring_b)
+    return best_choice[0], best_choice[1], best_choice[2], min_ring_b
+
+
 def _scope_vmem_and_ops(
     scope: FusionScope,
     ctx: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
-) -> tuple[int, float, int, int, int, bool, str]:
-    """Compute static VMEM, activation HBM bytes, op count, and token split count."""
+) -> tuple[int, float, int, int, int, bool, str, int, int]:
+    """Compute static VMEM, activation HBM bytes, ops, splits, and ring slots."""
     vmem_budget = ctx.vmem_budget
     single_layer_dense_staging = ctx.single_layer_dense_staging_bytes
     single_layer_expert_staging = ctx.single_layer_expert_staging_bytes
-    whole_step_dense_staging = ctx.whole_step_dense_staging_bytes
-    whole_step_expert_staging = ctx.whole_step_expert_staging_bytes
     gqa_scratch = ctx.gqa_scratch
     gdn_scratch = ctx.gdn_scratch
     ffn_scratch = ctx.ffn_scratch
@@ -754,53 +907,50 @@ def _scope_vmem_and_ops(
 
     if scope == "per_op":
         static_vmem_bytes = max(1 << 20, single_layer_dense_staging)
-        alpha = 4 * profile.hidden_size
+        alpha = _FP32_BYTES * profile.hidden_size
         n_splits = 1
         t_max = max(active_tokens, (vmem_budget - static_vmem_bytes) // alpha)
         n_ops = 2 * layers_local
         act_bytes = 4.0 * layers_local * token_residual_bytes
-        return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
+        return (
+            static_vmem_bytes,
+            act_bytes,
+            n_ops,
+            t_max,
+            n_splits,
+            feasible,
+            reason,
+            0,
+            0,
+        )
 
     is_single_layer = scope == "single_layer"
     is_single_or_preset_group = is_single_layer or (
         scope == "layer_group" and preset_groups > 0
     )
     mul = (preset_groups or num_segments) if scope == "layer_group" else 1
-    dense_staging_bytes = (
-        single_layer_dense_staging
-        if is_single_or_preset_group
-        else whole_step_dense_staging
-    )
-    expert_staging_bytes = (
-        single_layer_expert_staging
-        if is_single_or_preset_group
-        else whole_step_expert_staging
-    ) * (l_moe > 0)
-    scratch_alias = (
+    scratch_op_bytes = (
         max(gqa_scratch, gdn_scratch, ffn_scratch)
-        if is_single_layer
-        else max(gqa_scratch + gdn_scratch, ffn_scratch)
+        if workload.vmem_alias
+        else (gqa_scratch + gdn_scratch + ffn_scratch)
     )
-    moe_alignment_pad_bytes = (
-        (min(12 << 20, expert_staging_bytes) if workload.tiles else (12 << 20))
-        if l_moe > 0
-        else (2 << 20)
-    )
-    pad_bytes = (
-        0
-        if is_single_or_preset_group
-        else moe_alignment_pad_bytes + 2304 * profile.hidden_size * (l_moe == 0)
-    )
-    static_vmem_bytes = (
-        dense_staging_bytes
-        + expert_staging_bytes
-        + (
-            scratch_alias
-            if workload.vmem_alias
-            else gqa_scratch + gdn_scratch + ffn_scratch
+    if is_single_or_preset_group:
+        sel_nbd = workload.dma_buffers
+        sel_nbe = workload.dma_buffers if l_moe > 0 else 0
+        static_vmem_bytes = (
+            single_layer_dense_staging
+            + single_layer_expert_staging * (l_moe > 0)
+            + scratch_op_bytes
         )
-        + pad_bytes
-    )
+        min_static_bytes = static_vmem_bytes
+    else:
+        sel_nbd, sel_nbe, ring_bytes, min_ring_bytes = _select_adaptive_ring(
+            ctx, workload, scratch_op_bytes + _ARENA_ALIGN_RESERVE_BYTES
+        )
+        static_vmem_bytes = ring_bytes + scratch_op_bytes + _ARENA_ALIGN_RESERVE_BYTES
+        min_static_bytes = (
+            min_ring_bytes + scratch_op_bytes + _ARENA_ALIGN_RESERVE_BYTES
+        )
     act_bytes = 2.0 * (layers_local if is_single_layer else mul) * token_residual_bytes
     n_ops = (
         layers_local
@@ -812,13 +962,23 @@ def _scope_vmem_and_ops(
     alpha = per_token_fused_bytes
     t_max = (
         0
-        if static_vmem_bytes + alpha > vmem_budget
-        else max(1, (vmem_budget - static_vmem_bytes) // alpha)
+        if min_static_bytes + alpha > vmem_budget
+        else max(1, (vmem_budget - min_static_bytes) // alpha)
     )
     n_splits = active_tokens if t_max == 0 else ceil(active_tokens / t_max)
     if t_max == 0:
         feasible, reason = False, "Weight buffers exceed VMEM"
-    return static_vmem_bytes, act_bytes, n_ops, t_max, n_splits, feasible, reason
+    return (
+        static_vmem_bytes,
+        act_bytes,
+        n_ops,
+        t_max,
+        n_splits,
+        feasible,
+        reason,
+        sel_nbd,
+        sel_nbe,
+    )
 
 
 def _experts_hit(
@@ -903,6 +1063,8 @@ def _evaluate_scopes(
             n_splits,
             feasible,
             reason,
+            sel_nbd,
+            sel_nbe,
         ) = _scope_vmem_and_ops(scope, ctx, profile, workload)
         tiled = scope in ("whole_step", "layer_group") and n_splits > 1
         tile_tokens = ceil(active_tokens / max(1, n_splits))
@@ -933,25 +1095,43 @@ def _evaluate_scopes(
             if scope == "per_op" and ctx.eff_tp > 1
             else 0.0
         )
-        t_comm = (
+        is_fused_multi = scope in ("whole_step", "layer_group")
+        overlapped_comm = is_fused_multi and n_splits == 1
+        ar_and_pcp_s = (
             num_ar
             * (ctx.ar_transfer_time_s + n_splits * xla_ar_factor * ctx.ar_base_lat_s)
             + xla_hbm_coll_bytes / bw_hbm
-            + pp_stage_time
-            + (
-                l_moe * (a2a_time + 2 * n_splits * xla_ar_factor * lat_coll)
-                if l_moe > 0 and ep_dp > 1
-                else 0.0
-            )
+            + ctx.pcp_ring_time
+        )
+        a2a_sync_s = (
+            l_moe * (a2a_time + 2 * n_splits * xla_ar_factor * lat_coll)
+            if l_moe > 0 and ep_dp > 1
+            else 0.0
+        )
+        dcn_sync_s = num_ar * n_splits * xla_ar_factor * ctx.ar_inter_latency_s
+        sync_stage_s = (
+            (dcn_sync_s + pp_stage_time + a2a_sync_s)
+            if overlapped_comm
+            else (ar_and_pcp_s + pp_stage_time + a2a_sync_s)
+            if is_fused_multi
+            else 0.0
+        )
+        comm_s = (
+            (ar_and_pcp_s - dcn_sync_s)
+            if overlapped_comm
+            else 0.0
+            if is_fused_multi
+            else (ar_and_pcp_s + pp_stage_time + a2a_sync_s)
         )
         eff_state_bytes = kv_cache_read_bytes + recurrent_state_rw_bytes
         pipeline_fill_drain_s = (n_ops - 1) * (
             first_slot_bytes / bw_hbm + 2.0 * lat_coll
-        )
+        ) + sync_stage_s
         if tiled:
             tile_residual_bytes = tile_tokens * profile.hidden_size * 2.0
             pipeline_fill_drain_s += (
                 (n_splits - 1)
+                * 2
                 * layers_local
                 * (tile_residual_bytes / bw_hbm + 2.0 * lat_coll)
             )
@@ -967,12 +1147,14 @@ def _evaluate_scopes(
         )
         act_saved = 4.0 * layers_local * token_residual_bytes - act_bytes
         hbm_int = (1 if tiled else n_splits) * w_step + eff_state_bytes
+        hbm_time_s = (hbm_int + act_bytes) / bw_hbm
         d_ops = sub_ops - n_ops
-        roof_us = (
-            max(t_matmul, (hbm_int + act_bytes) / bw_hbm)
-            + t_comm
-            + pipeline_fill_drain_s
-        ) * 1e6
+        roof_core_s = (
+            max(t_matmul, hbm_time_s, comm_s)
+            if is_fused_multi
+            else (max(t_matmul, hbm_time_s) + comm_s)
+        )
+        roof_us = (roof_core_s + pipeline_fill_drain_s) * 1e6
         base_ai = (flops_dense + flops_moe) / max(
             1.0, w_step + kv_cache_read_bytes + recurrent_state_rw_bytes
         )
@@ -986,16 +1168,41 @@ def _evaluate_scopes(
             sub_pure_us = pure_us
         step_us = pure_us + n_ops * workload.op_overhead_us
 
-        coll_extra_s = (
-            num_ar * n_splits * xla_ar_factor * ctx.ar_intra_hops
-            + (2 * l_moe * n_splits * xla_ar_factor if l_moe > 0 and ep_dp > 1 else 0)
+        eff = workload.efficiency
+        eta_moe = eff.eta_moe_grouped if grouped_moe and l_moe > 0 else eff.eta_dense
+        t_comp_ach = (flops_dense / peak_w) / max(1e-3, eff.eta_dense) + (
+            (phi * flops_moe) / peak_e
+        ) / max(1e-3, eta_moe)
+        t_hbm_ach = hbm_time_s / max(1e-3, eff.eta_hbm)
+        t_comm_ach = comm_s / max(1e-3, eff.eta_ici)
+        sync_comm_extra_s = (
+            sync_stage_s * (1.0 / max(1e-3, eff.eta_ici) - 1.0)
+            if is_fused_multi
+            else 0.0
+        )
+        ach_core_s = (
+            (max(t_comp_ach, t_hbm_ach, t_comm_ach) + sync_comm_extra_s)
+            if is_fused_multi
+            else (max(t_comp_ach, t_hbm_ach) + t_comm_ach)
+        )
+        step_ach_us = (
+            (ach_core_s + pipeline_fill_drain_s) * 1e6
+            + repass_spill_us
+            + n_ops * workload.op_overhead_us
+        )
+
+        ar_extra_s = (num_ar * n_splits * xla_ar_factor * ctx.ar_intra_hops) * max(
+            0.0, ctx.lat_coll_upper - lat_coll
+        )
+        a2a_extra_s = (
+            (2 * l_moe * n_splits * xla_ar_factor) if l_moe > 0 and ep_dp > 1 else 0
         ) * max(0.0, ctx.lat_coll_upper - lat_coll)
-        roof_upper_us = (
-            max(t_matmul_upper, (hbm_int + act_bytes) / bw_hbm)
-            + t_comm
-            + coll_extra_s
-            + pipeline_fill_drain_s
-        ) * 1e6
+        roof_upper_core_s = (
+            (max(t_matmul_upper, hbm_time_s, comm_s + ar_extra_s) + a2a_extra_s)
+            if overlapped_comm
+            else (max(t_matmul_upper, hbm_time_s) + comm_s + ar_extra_s + a2a_extra_s)
+        )
+        roof_upper_us = (roof_upper_core_s + pipeline_fill_drain_s) * 1e6
         step_upper_us = max(
             step_us,
             roof_upper_us + repass_spill_us + n_ops * ctx.launch_gap_upper_us,
@@ -1026,6 +1233,9 @@ def _evaluate_scopes(
                 moe_flop_factor=round(phi, 3),
                 roof_floor_us=round(roof_us, 2),
                 step_bound_us=round(step_us, 2),
+                selected_nbd=sel_nbd,
+                selected_nbe=sel_nbe,
+                step_achievable_us=round(step_ach_us, 2),
                 break_even_op_overhead_us=break_even,
                 step_upper_us=round(step_upper_us, 2),
             )
@@ -1041,8 +1251,6 @@ class _ScopeContext:
     vmem_budget: int
     single_layer_dense_staging_bytes: int
     single_layer_expert_staging_bytes: int
-    whole_step_dense_staging_bytes: int
-    whole_step_expert_staging_bytes: int
     first_slot_bytes: float
     gqa_scratch: int
     gdn_scratch: int
@@ -1081,6 +1289,7 @@ class _ScopeContext:
     lat_coll_upper: float
     launch_gap_upper_us: float
     pp_stage_time: float
+    pcp_ring_time: float
     a2a_time: float
     flops_dense: float
     flops_kv: float
@@ -1112,30 +1321,15 @@ def _vmem_budget_bytes(workload: WorkloadSpec, chip_spec: ChipSpec) -> int:
     return min(vmem_usable, max(0, vmem_raw))
 
 
-def _whole_step_staging(
-    workload: WorkloadSpec, layer_dense_weight_bytes: int
-) -> tuple[float, int, int]:
-    """Return first DMA slot bytes and multi-layer dense and expert staging bytes."""
+def _first_slot_bytes(workload: WorkloadSpec, layer_dense_weight_bytes: int) -> float:
+    """Return first weight DMA slot size in bytes for pipeline fill/drain."""
     tiles = workload.tiles
     if tiles is not None:
         dense_slot_bytes = tiles.bank
-        dense_staging = tiles.nbd * tiles.bank
-        expert_staging = tiles.nbe * tiles.ebank
     else:
         rp = workload.ring_plan or default_double_buffer_ring_plan(workload.dma_buffers)
         dense_slot_bytes = rp.dense_slot_bytes
-        extra_dense_bytes = (
-            rp.dense_slots - _DOUBLE_BUFFER_SLOTS
-        ) * rp.dense_slot_bytes
-        extra_expert_bytes = (
-            rp.expert_slots - _DOUBLE_BUFFER_SLOTS
-        ) * rp.expert_slot_bytes
-        dense_staging = min(28 << 20, 2 * layer_dense_weight_bytes) + extra_dense_bytes
-        expert_staging = (10 << 20) + extra_expert_bytes
-    first_slot_bytes = float(
-        min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4))
-    )
-    return first_slot_bytes, dense_staging, expert_staging
+    return float(min(dense_slot_bytes, max(1 << 18, layer_dense_weight_bytes // 4)))
 
 
 def _build_scope_context(
@@ -1215,10 +1409,13 @@ def _build_scope_context(
     mla_proj_params = (
         q_lora * (hidden + q_tot) if q_lora else hidden * q_tot
     ) + hidden * (kv_lora + qk_rope + q_dim)
+    attn_gate_params = (
+        hidden * q_dim if profile.has_attn_output_gate and not kv_lora else 0
+    )
     attn_params = (
         mla_proj_params + kv_lora * nh_local * (qk_nope + head_dim)
         if kv_lora
-        else hidden * 2 * (q_dim + kvh_local * head_dim)
+        else hidden * 2 * (q_dim + kvh_local * head_dim) + attn_gate_params
     )
     kh_local = max(1, ceil(profile.linear_key_heads / eff_tp)) if l_lin > 0 else 0
     vh_local = max(1, ceil(profile.linear_value_heads / eff_tp)) if l_lin > 0 else 0
@@ -1315,11 +1512,7 @@ def _build_scope_context(
     )
 
     buf_slots = workload.dma_buffers
-    (
-        first_slot_bytes,
-        whole_step_dense_staging_bytes,
-        whole_step_expert_staging_bytes,
-    ) = _whole_step_staging(workload, layer_dense_weight_bytes)
+    first_slot_bytes = _first_slot_bytes(workload, layer_dense_weight_bytes)
     has_unmodeled_family = any(
         fam not in SUPPORTED_ONCHIP_FAMILIES for fam in profile.layer_families
     )
@@ -1344,17 +1537,57 @@ def _build_scope_context(
         if eff_tp <= _CHIPS_PER_HOST
         else round(math.log2(num_hosts)) * _DEFAULT_DCN_HOP_LATENCY_S
     )
+    dense_bank = (
+        workload.tiles.bank
+        if workload.tiles is not None
+        else (
+            workload.ring_plan.dense_slot_bytes
+            if workload.ring_plan is not None
+            else _DENSE_SLOT_DEFAULT_BYTES
+        )
+    )
+    expert_bank = (
+        workload.tiles.ebank
+        if workload.tiles is not None
+        else (
+            workload.ring_plan.expert_slot_bytes
+            if workload.ring_plan is not None
+            else _EXPERT_SLOT_DEFAULT_BYTES
+        )
+    )
+    pcp_ring_time = (
+        (eff_pcp - 1)
+        * l_attn
+        * chunk_tokens
+        * (kv_bytes_per_tok * kv_split)
+        / chip_spec.ici_link_bw_bytes_per_s
+        if eff_pcp > 1 and l_attn > 0
+        else 0.0
+    )
     return _ScopeContext(
         vmem_budget=vmem_budget,
-        single_layer_dense_staging_bytes=min(4 << 20, layer_dense_weight_bytes),
-        single_layer_expert_staging_bytes=min(4 << 20, int(buf_slots * exp_bytes)),
-        whole_step_dense_staging_bytes=whole_step_dense_staging_bytes,
-        whole_step_expert_staging_bytes=whole_step_expert_staging_bytes,
+        single_layer_dense_staging_bytes=min(
+            buf_slots * dense_bank, buf_slots * layer_dense_weight_bytes
+        ),
+        single_layer_expert_staging_bytes=min(
+            buf_slots * expert_bank, int(buf_slots * exp_bytes)
+        ),
         first_slot_bytes=first_slot_bytes,
-        gqa_scratch=3072 * max(head_dim, kv_lora) if l_attn > 0 else 0,
-        gdn_scratch=16 * min(vh_local, 8) * kd * vd,
+        gqa_scratch=(
+            2 * _ATTN_TILE_TOKENS * (_FP32_BYTES * max(head_dim, kv_lora))
+            + 2 * _ATTN_TILE_TOKENS * _ATTN_TILE_TOKENS * _FP32_BYTES
+            if l_attn > 0
+            else 0
+        ),
+        gdn_scratch=(
+            _FP32_BYTES * min(vh_local, _GDN_STREAMED_HEADS_CAP) * kd * vd
+            if l_lin > 0
+            else 0
+        ),
         ffn_scratch=(
-            (1024 * max(1, i_exp_local or hidden)) if l_moe > 0 else (2 << 20)
+            (2 * _ATTN_TILE_TOKENS * i_exp_local)
+            if l_moe > 0
+            else (2 * _ATTN_TILE_TOKENS * _DENSE_FFN_TILE_CAP * _FP32_BYTES)
         ),
         layers_local=layers_local,
         num_segments=num_segments,
@@ -1405,6 +1638,7 @@ def _build_scope_context(
             if pp > 1
             else 0.0
         ),
+        pcp_ring_time=pcp_ring_time,
         a2a_time=(
             2.0
             * (ep_dp - 1)
@@ -1456,10 +1690,44 @@ def _resolve_calibrated_priors(
     tuple[float, list[float], ProvenanceTag, str],
 ]:
     """Return calibrated or assumed priors for launch gap, collectives, and coverage."""
-    if meas is not None and meas.launch_gap_p50_us is not None:
+    if workload.dispatch_regime == "zero_floor":
+        lg_info: tuple[float, float, float, ProvenanceTag, str] = (
+            0.0,
+            0.0,
+            0.0,
+            "DERIVED",
+            "zero_floor compiler-proof physics regime (0.0 us/boundary)",
+        )
+    elif workload.dispatch_regime == "compiled_xla":
+        if meas is not None and meas.launch_gap_p50_us is not None:
+            lg_lo = meas.launch_gap_p50_us
+            lg_hi = max(lg_lo, meas.launch_gap_p90_us or lg_lo)
+            lg_src_str = f"{meas.source_desc} (n={meas.launch_gap_n})"
+        else:
+            lg_lo = _COMPILED_XLA_GAP_P50_US
+            lg_hi = _COMPILED_XLA_GAP_P90_US
+            lg_src_str = (
+                "TPU v7x XPlane steady-state step prior "
+                f"(n={_COMPILED_XLA_SAMPLE_COUNT})"
+            )
+        lg_info = (lg_lo, lg_lo, lg_hi, "MEASURED", lg_src_str)
+    elif workload.dispatch_regime == "unfused_eager":
+        lg_val = (
+            workload.op_overhead_us
+            if workload.op_overhead_us > 0.0
+            else _UNFUSED_EAGER_GAP_US
+        )
+        lg_info = (
+            lg_val,
+            lg_val,
+            max(lg_val, _DEFAULT_LAUNCH_GAP_UPPER_US),
+            "ASSUMED",
+            "unfused_eager exposed dispatch sensitivity regime",
+        )
+    elif meas is not None and meas.launch_gap_p50_us is not None:
         lg_lo = meas.launch_gap_p50_us
         lg_hi = max(lg_lo, meas.launch_gap_p90_us or lg_lo)
-        lg_info: tuple[float, float, float, ProvenanceTag, str] = (
+        lg_info = (
             lg_lo,
             lg_lo,
             lg_hi,
@@ -1569,7 +1837,8 @@ def _assumed_box(
     # Uncalibrated floor keeps the zero-launch roofline; a trace floor uses p50.
     lg_box = (
         (lg_lo, lg_hi)
-        if lg_tag == "MEASURED"
+        if lg_tag in ("MEASURED", "DERIVED")
+        or workload.dispatch_regime == "unfused_eager"
         else (workload.op_overhead_us, ctx.launch_gap_upper_us)
     )
     coll_box = (
@@ -1911,6 +2180,27 @@ def _build_provenance_and_verdict(
             "tag": b_tag,
             "source": "(per_op_ops - scope_ops) * launch_gap_us + collective_saving_us",
             "band": [min(b_lo, b_hi), max(b_lo, b_hi)],
+        },
+        "compiler_proof_gain_us": {
+            "value": round(pure_diff_us, 2),
+            "unit": "us",
+            "tag": "DERIVED",
+            "source": "per_op_physics_us - best_scope_physics_us (0 us boundary gap)",
+            "band": [
+                round(pure_diff_us, 2),
+                round(
+                    pure_diff_us
+                    + ctx.num_ar * ctx.ar_hops * max(0.0, coll_hi - coll_lo),
+                    2,
+                ),
+            ],
+        },
+        "dispatch_bubble_gain_us": {
+            "value": round(d_ops * lg_val, 2),
+            "unit": "us",
+            "tag": lg_tag,
+            "source": "(per_op_ops - best_scope_ops) * launch_gap_us",
+            "band": [round(d_ops * lg_lo, 2), round(d_ops * lg_hi, 2)],
         },
         "fusion_gain_max": {
             "value": fg_val,
@@ -2565,6 +2855,12 @@ def advise_regimes(
     obj_mode: ObjectiveMode = (
         raw_obj if raw_obj in ("step", "throughput", "both") else "step"
     )
+    raw_dr = str(opts.get("dispatch_regime", "auto"))
+    dr_mode: DispatchRegime = (
+        raw_dr
+        if raw_dr in ("auto", "zero_floor", "compiled_xla", "unfused_eager")
+        else "auto"
+    )
     base = WorkloadSpec(
         vmem_alias=bool(opts.get("vmem_alias", True)),
         vmem_fit_headroom=bool(opts.get("vmem_fit_headroom", False)),
@@ -2572,6 +2868,7 @@ def advise_regimes(
         vmem_budget_mib=vmem_budget_mib,
         dma_buffers=_int_opt(opts, "dma_buffers", 2),
         objective=obj_mode,
+        dispatch_regime=dr_mode,
     )
     dma_buffers = base.dma_buffers
 
@@ -2981,6 +3278,8 @@ __all__ = [
     "ChipSpec",
     "DeploymentPreset",
     "DisaggHandoffSpec",
+    "DispatchRegime",
+    "EfficiencySpec",
     "FieldSource",
     "FusionScope",
     "MeasurementsData",
@@ -3017,6 +3316,7 @@ __all__ = [
     "resolve_chip_spec",
     "resolve_model_profile",
     "supports_hf_config",
+    "validate_workload",
     "verify_chip_spec_against_jax",
     "write_advisor_html",
 ]

@@ -159,10 +159,9 @@ _PREFILL_STAGE_FLOOR_MIN_US = 30_000.0
 _PREFILL_STAGE_FLOOR_MAX_US = 60_000.0
 _PREFILL_STAGE_MEASURED_US = 136_010.0
 _MEASURED_COVERAGE = 0.85
-# Shipped Qwen3.5 decode megakernel: microbatch rows when a verify bucket splits.
-# Buckets up to 112 rows still run as one call by trading expert-ring depth for
-# VMEM, which the advisor does not model.
-_QWEN35_SPLIT_VERIFY_ROWS = 80
+# Shipped Qwen3.5 decode megakernel: single-pass verify rows under adaptive
+# (2, 2) ring contraction on the 62.0 MiB usable VMEM floorplan.
+_QWEN35_SPLIT_VERIFY_ROWS = 452
 # 16 sequences x MTP-3 verify (4 rows per sequence) in one call.
 _QWEN35_VERIFY_ROWS_MIN = 64
 # Shipped Kimi-K3 prefill calls: embedding + layers 0-3, 11 groups, last layer.
@@ -418,7 +417,11 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
     ) == (62 << 20, 126 << 20, 14 << 20)
 
     p397 = advisor.model_profile_from_hf_config(_QWEN35_397B_CFG, name="qwen35-397b")
-    rep_v4 = advisor.advise(p397, advisor.WorkloadSpec(tp=8, batch=4), cv4)
+    rep_v4 = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(tp=8, batch=4, tiles=Tiles(nbd=8, nbe=4)),
+        cv4,
+    )
     v4_cross = next(s for s in rep_v4.scopes if s.scope == "whole_step")
     assert rep_v4.hbm_fits is False
     assert rep_v4.build_megakernel is False
@@ -504,8 +507,8 @@ def test_multi_tpu_vmem_and_fp8_dtype_physics() -> None:
 
 def test_asymptotic_decode_intensity_and_vmem_fit_headroom() -> None:
     """Verify `asymptotic_decode_intensity`, `fit_vmem_budget_bytes`, `w_crit_gb`."""
-    assert advisor.fit_vmem_budget_bytes() == 56 << 20
-    assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == 56 << 20
+    assert advisor.fit_vmem_budget_bytes() == 62 << 20
+    assert advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == 62 << 20
     p08 = advisor.model_profile_from_hf_config(
         _QWEN35_08B_CFG, name="qwen35-0.8b", state_dtype="fp32"
     )
@@ -589,28 +592,37 @@ def test_all_four_fusion_scopes_reachable() -> None:
     assert r_08_pre.recommended_scope == "whole_step"
     assert r_08_pre.recommended_moe_mode == "dense_mlp"
 
-    # 2. `single_layer` (`layer`) wins in the B=96 VMEM cliff band on tpu7x,
+    # 2. `single_layer` (`layer`) wins in the B=488 VMEM cliff band on tpu7x,
     # whereas v6e (TP16) and v5p Megacore (TP8) keep `whole_step` in 1 pass.
-    r_b96_7x = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=8), "tpu7x"
+    r_cliff_7x = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(phase="decode", batch=488, context=1024, tp=8),
+        "tpu7x",
     )
-    assert r_b96_7x.recommended_scope == "single_layer"
-    assert r_b96_7x.recommended_moe_mode == "grouped_on_chip"
-    r_b96_v6e = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=16), "v6e"
+    assert r_cliff_7x.recommended_scope == "single_layer"
+    assert r_cliff_7x.recommended_moe_mode == "grouped_on_chip"
+    r_cliff_v6e = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(phase="decode", batch=488, context=1024, tp=16),
+        "v6e",
     )
-    assert r_b96_v6e.recommended_scope == "whole_step"
+    assert r_cliff_v6e.recommended_scope == "whole_step"
     v5p_mc = advisor.resolve_chip_spec("v5p", megacore=True)
-    r_b96_v5p_mc = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=96, tp=8), v5p_mc
+    r_cliff_v5p_mc = advisor.advise(
+        p397,
+        advisor.WorkloadSpec(phase="decode", batch=488, context=1024, tp=8),
+        v5p_mc,
     )
-    assert r_b96_v5p_mc.recommended_scope == "whole_step"
+    assert r_cliff_v5p_mc.recommended_scope == "whole_step"
     r_ep8_sat = advisor.advise(
-        p397, advisor.WorkloadSpec(phase="decode", batch=600, tp=2, dp=4, ep=8), "tpu7x"
+        p397,
+        advisor.WorkloadSpec(
+            phase="decode", batch=600, tp=2, dp=4, ep=8, tiles=Tiles()
+        ),
+        "tpu7x",
     )
-    # Saturated DP4 x TP2 decode: 150 tok/core overflow the whole-step ceiling;
-    # with MoE priced in the recommended on-chip grouped mode, one call per
-    # layer beats per-op kernels.
+    # Saturated DP4 x TP2 decode with locked wide ring: 150 tok/core overflow
+    # the wide whole-step ceiling while single_layer fits in 1 pass.
     assert r_ep8_sat.recommended_scope == "single_layer"
     assert r_ep8_sat.recommended_moe_mode == "grouped_on_chip"
 
@@ -666,7 +678,7 @@ def test_bare_minimum_auto_parallelism_and_html_regime_report(tmp_path: Path) ->
         by_label["Decode High (B=64, T=1, 32K)"].recommended_moe_mode
         == "grouped_on_chip"
     )
-    assert by_label["Chunked Prefill (B=1, T=256)"].recommended_scope == "single_layer"
+    assert by_label["Chunked Prefill (B=1, T=256)"].recommended_scope == "whole_step"
     assert (
         by_label["Chunked Prefill (B=1, T=256)"].recommended_moe_mode
         == "grouped_on_chip"
@@ -725,13 +737,13 @@ def test_qwen38_24t_decode_regime_crossover_and_moe_modes() -> None:
         assert entry.recommended_moe_mode == "masked_on_chip"
         assert entry.num_vmem_splits == 1
 
-    for layer_lbl in (
+    for wide_lbl in (
         "Decode High (B=64, T=1, 32K)",
         "Spec Verify Med (B=16, K=3)",
         "Chunked Prefill (B=1, T=256)",
     ):
-        entry = by_label[layer_lbl]
-        assert entry.recommended_scope == "single_layer"
+        entry = by_label[wide_lbl]
+        assert entry.recommended_scope == "whole_step"
         assert entry.recommended_moe_mode == "grouped_on_chip"
 
     long_pre = by_label["Long Prefill (B=1, T=4096)"]
@@ -1044,7 +1056,7 @@ def test_whole_step_tiles_overflow_and_reads_weights_once() -> None:
         _preset_workload(
             dep.decode,
             phase="verify",
-            batch=_QWEN35_SPLIT_VERIFY_ROWS // (dep.decode.spec_tokens + 1),
+            batch=(_QWEN35_SPLIT_VERIFY_ROWS // (dep.decode.spec_tokens + 1)) + 4,
             spec_tokens=dep.decode.spec_tokens,
             moe_mode="grouped_on_chip",
         ),
@@ -1249,15 +1261,18 @@ def test_shared_assumptions_keep_decode_megakernel_verdict() -> None:
 
 
 def test_tie_only_when_winner_flips_between_corners() -> None:
-    """Verify Qwen3.5-397B T=256 prefill flips to layer_group at high launch gap."""
-    row = _regime("qwen3.5-397b", "Chunked Prefill")
-    assert row.recommended_scope == "single_layer"
-    assert row.verdict == "tie(measure: launch_gap_us)"
-    assert "vs runner-up layer_group" in row.rationale
-    assert "layer_group wins at launch gap 8.0 us" in row.rationale
-    knob = row.verdict.removeprefix("tie(measure: ").removesuffix(")")
+    """Verify VMEM-split decode boundary flips from single_layer to whole_step."""
+    wl = advisor.WorkloadSpec(
+        phase="decode", batch=512, tp=8, dp=2, ep=16, dcp=4, context=2048
+    )
+    rep = advisor.advise("qwen3.5-397b", wl, "tpu7x")
+    assert rep.recommended_scope == "single_layer"
+    assert rep.verdict == "tie(measure: collective_latency_us)"
+    assert "vs runner-up whole_step" in rep.rationale
+    assert "whole_step wins at launch gap 0.0 us" in rep.rationale
+    knob = rep.verdict.removeprefix("tie(measure: ").removesuffix(")")
     scope_inputs = {
-        u["name"] for u in row.unresolved_assumptions if u["affects"] == "scope"
+        u["name"] for u in rep.unresolved_assumptions if u["affects"] == "scope"
     }
     assert knob in scope_inputs
 
@@ -1268,7 +1283,7 @@ def test_measurements_narrow_scope_band_and_settle_verdict(tmp_path: Path) -> No
     m_payload = {
         "schema": "advisor.measurements.v1",
         "source": {"kind": "xplane", "file": "trace.xplane.pb", "tool": "calibrate"},
-        "launch_gap_us": {"p50": 3.0, "p90": 3.0, "n": 40},
+        "launch_gap_us": {"p50": 0.5, "p90": 0.5, "n": 40},
         "collectives": [
             {
                 "op": "all_reduce",
@@ -1280,13 +1295,17 @@ def test_measurements_narrow_scope_band_and_settle_verdict(tmp_path: Path) -> No
         ],
     }
     m_file.write_text(json.dumps(m_payload), encoding="utf-8")
-    prior = _regime("qwen3.5-397b", "Decode Saturated")
+    cliff_wl = advisor.WorkloadSpec(
+        phase="decode", batch=512, tp=8, dp=2, ep=16, dcp=4, context=2048
+    )
+    prior = advisor.advise("qwen3.5-397b", cliff_wl, "tpu7x")
     assert prior.verdict.startswith("tie(measure: ")
-    row = _regime("qwen3.5-397b", "Decode Saturated", measurements=m_file)
+    row = advisor.advise("qwen3.5-397b", cliff_wl, "tpu7x", measurements=m_file)
     assert row.metrics["launch_gap_us"]["tag"] == "MEASURED"
     assert row.metrics["collective_latency_us"]["tag"] == "MEASURED"
     # Decode has no attention dtype band, so a degenerate box gives a zero-width band.
-    assert row.step_upper_us == row.step_bound_us
+    rec_scope = next(s for s in row.scopes if s.scope == row.recommended_scope)
+    assert rec_scope.step_upper_us == rec_scope.step_bound_us
     assert not row.verdict.startswith("tie")
 
 
@@ -1529,7 +1548,7 @@ def test_pd_disagg_alignment_qwen35_and_kimi_k3_and_dcn_handoff(
     assert q_by_lbl["Decode Med (B=16, T=1, 4K)"].recommended_scope == "whole_step"
     assert q_by_lbl["Decode High (B=64, T=1, 32K)"].recommended_scope == "whole_step"
     assert q_sat.layout == "DP4 x TP2 x EP8"
-    assert q_sat.recommended_scope == "single_layer"
+    assert q_sat.recommended_scope == "whole_step"
     assert q_by_lbl["Preset Prefill Window (W=2176)"].layout == "PP8 x TP1"
     assert q_by_lbl["Preset Prefill Window (W=2176)"].recommended_scope == "per_op"
     assert q_sweep.disagg_handoff is not None
@@ -1825,3 +1844,160 @@ def test_multi_host_all_reduce_respects_dcn_bandwidth() -> None:
     assert t_fast < t_default
     assert lat_fast == lat_default
     assert hops == _MULTI_HOST_TP_HOPS
+
+
+_EXPECTED_VMEM_BUDGET_BYTES = 62 << 20
+_EXPECTED_WIDE_DENSE_SLOTS = 14
+_EXPECTED_WIDE_EXPERT_SLOTS = 10
+_EXPECTED_MIN_RING_SLOTS = 2
+_EXPECTED_ATTN_GATE_DELTA_GB = round((15 * 4096 * (4 * 256)) / 1e9, 4)
+
+
+def test_vmem_budget_no_double_spill_subtraction() -> None:
+    """Verify fit_vmem_budget_bytes and vmem_fit_headroom keep 62.0 MiB usable VMEM."""
+    assert advisor.fit_vmem_budget_bytes() == _EXPECTED_VMEM_BUDGET_BYTES
+    assert (
+        advisor.fit_vmem_budget_bytes(Tiles(vmem_mib=62)) == _EXPECTED_VMEM_BUDGET_BYTES
+    )
+    rep_fit = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=64, tp=8, vmem_fit_headroom=True),
+        "tpu7x",
+    )
+    rep_std = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=64, tp=8, vmem_fit_headroom=False),
+        "tpu7x",
+    )
+    assert rep_fit.vmem_budget_mib == _TPU7X_VMEM_MIB
+    assert rep_fit.vmem_budget_mib == rep_std.vmem_budget_mib
+
+
+def test_adaptive_ring_contraction_single_pass_wide_batch() -> None:
+    """Verify adaptive ring shrinks from (14, 10) to (2, 2) before splitting passes."""
+    rep_small = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
+        "tpu7x",
+    )
+    ws_small = next(s for s in rep_small.scopes if s.scope == "whole_step")
+    assert ws_small.selected_nbd == _EXPECTED_WIDE_DENSE_SLOTS
+    assert ws_small.selected_nbe == _EXPECTED_WIDE_EXPERT_SLOTS
+    assert ws_small.n_splits == 1
+
+    rep_wide = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=448, tp=8, ep=8),
+        "tpu7x",
+    )
+    ws_wide = next(s for s in rep_wide.scopes if s.scope == "whole_step")
+    assert ws_wide.selected_nbd == _EXPECTED_MIN_RING_SLOTS
+    assert ws_wide.selected_nbe == _EXPECTED_MIN_RING_SLOTS
+    assert ws_wide.n_splits == 1
+
+    rep_llama = advisor.advise(
+        "llama-3.1-405b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8),
+        "tpu7x",
+    )
+    ws_llama = next(s for s in rep_llama.scopes if s.scope == "whole_step")
+    assert ws_llama.t_vmem_max > 0
+    assert ws_llama.n_splits == 1
+    assert ws_llama.selected_nbe == 0
+
+
+def test_kimi_k3_dense_prefix_moe_and_qwen35_attn_gate() -> None:
+    """Verify Kimi-K3 dense_prefix_moe flag and Qwen3.5 attention output gate size."""
+    k3 = advisor.resolve_model_profile("kimi-k3")
+    assert k3.is_periodic is False
+    assert "dense_prefix_moe" in k3.non_homogeneous_reasons
+
+    q35 = advisor.resolve_model_profile("qwen3.5-397b")
+    assert q35.has_attn_output_gate is True
+    q35_ungated = dataclasses.replace(q35, has_attn_output_gate=False)
+    wl = advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=8)
+    rep_gated = advisor.advise(q35, wl, "tpu7x")
+    rep_ungated = advisor.advise(q35_ungated, wl, "tpu7x")
+    w_diff = round(rep_gated.scopes[0].w_step_gb - rep_ungated.scopes[0].w_step_gb, 4)
+    assert w_diff == pytest.approx(_EXPECTED_ATTN_GATE_DELTA_GB, abs=2e-4)
+
+
+def test_pcp_ring_attention_ici_and_validate_workload() -> None:
+    """Verify PCP > 1 prices RingAttention ICI volume and validate_workload flags."""
+    wl_pcp1 = advisor.WorkloadSpec(
+        phase="prefill", batch=1, isl=4096, chunk_size=512, tp=8, ep=8, pcp=1
+    )
+    wl_pcp8 = advisor.WorkloadSpec(
+        phase="prefill", batch=1, isl=4096, chunk_size=512, tp=8, ep=8, pcp=8
+    )
+    rep_pcp1 = advisor.advise("kimi-k3", wl_pcp1, "tpu7x")
+    rep_pcp8 = advisor.advise("kimi-k3", wl_pcp8, "tpu7x")
+    ws_pcp1 = next(s for s in rep_pcp1.scopes if s.scope == "per_op")
+    ws_pcp8 = next(s for s in rep_pcp8.scopes if s.scope == "per_op")
+    assert ws_pcp8.step_bound_us != ws_pcp1.step_bound_us
+
+    bad_ep = advisor.WorkloadSpec(phase="decode", batch=4, tp=8, ep=7)
+    reasons_ep = advisor.validate_workload("qwen3.5-397b", "tpu7x", bad_ep)
+    assert "experts_not_divisible_by_ep" in reasons_ep
+
+    bad_tp = advisor.WorkloadSpec(phase="decode", batch=4, tp=6, ep=1)
+    reasons_tp = advisor.validate_workload("qwen3.5-397b", "tpu7x", bad_tp)
+    assert "tp_not_power_of_two" in reasons_tp
+
+    oom_wl = advisor.WorkloadSpec(phase="decode", batch=512, context=131072, tp=8, ep=8)
+    reasons_oom = advisor.validate_workload("qwen3.5-397b", "tpu7x", oom_wl)
+    assert "hbm_pool_overflow" in reasons_oom
+
+
+def test_dispatch_regimes_and_compiler_proof_gain_split(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify zero_floor, compiled_xla, and unfused_eager dispatch regime metrics."""
+    rep_zero = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode", batch=16, tp=8, ep=8, dispatch_regime="zero_floor"
+        ),
+        "tpu7x",
+    )
+    rep_xla = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode", batch=16, tp=8, ep=8, dispatch_regime="compiled_xla"
+        ),
+        "tpu7x",
+    )
+    rep_eager = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode", batch=16, tp=8, ep=8, dispatch_regime="unfused_eager"
+        ),
+        "tpu7x",
+    )
+    assert rep_zero.metrics["launch_gap_us"]["tag"] == "DERIVED"
+    assert rep_zero.metrics["dispatch_bubble_gain_us"]["value"] == 0.0
+    assert rep_zero.metrics["compiler_proof_gain_us"]["value"] > 0.0
+    assert rep_xla.metrics["launch_gap_us"]["tag"] == "MEASURED"
+    assert (
+        rep_eager.metrics["dispatch_bubble_gain_us"]["value"]
+        > rep_xla.metrics["dispatch_bubble_gain_us"]["value"]
+    )
+    rc = advisor.main(
+        [
+            "--model",
+            "qwen3.5-397b",
+            "--tp",
+            "8",
+            "--ep",
+            "8",
+            "--batch",
+            "16",
+            "--dispatch-regime",
+            "compiled_xla",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    cli_payload = json.loads(capsys.readouterr().out)
+    assert cli_payload["metrics"]["launch_gap_us"]["tag"] == "MEASURED"
+    assert "compiler_proof_gain_us" in cli_payload["metrics"]

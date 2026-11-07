@@ -158,6 +158,8 @@ class ModelProfile:
     model_type: str = ""
     architecture_unverified: bool = False
     layer_families: tuple[str, ...] = ()
+    has_attn_output_gate: bool = False
+    non_homogeneous_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Derive attention/MoE layer counts, periodicity, and layer families."""
@@ -166,7 +168,7 @@ class ModelProfile:
         moe_layers = self.num_moe_layers
         attn_layers = self.num_attention_layers or (num_layers - self.num_linear_layers)
         moe_layers = num_layers * has_experts if moe_layers < 0 else moe_layers
-        periodic = self.is_periodic and not (0 < moe_layers < num_layers - 1)
+        periodic = self.is_periodic and not (0 < moe_layers < num_layers)
         moe_inter = self.moe_intermediate_size or (self.intermediate_size * has_experts)
         exp_dt = self.expert_dtype or self.weight_dtype
         mtype = self.model_type.strip().lower()
@@ -176,6 +178,9 @@ class ModelProfile:
         families = self.layer_families or _derive_layer_families(
             self, attn_layers=attn_layers, moe_layers=moe_layers
         )
+        reasons = self.non_homogeneous_reasons or _non_homogeneous_reasons(
+            num_layers, moe_layers
+        )
         updates = (
             ("num_attention_layers", attn_layers),
             ("num_moe_layers", moe_layers),
@@ -184,9 +189,17 @@ class ModelProfile:
             ("expert_dtype", exp_dt),
             ("architecture_unverified", unverified),
             ("layer_families", families),
+            ("non_homogeneous_reasons", reasons),
         )
         for key, val in updates:
             object.__setattr__(self, key, val)
+
+
+def _non_homogeneous_reasons(num_layers: int, moe_layers: int) -> tuple[str, ...]:
+    """Return non-homogeneity tags for mixed dense-prefix and MoE stacks."""
+    if 0 < moe_layers < num_layers:
+        return ("dense_prefix_moe",)
+    return ()
 
 
 def _derive_layer_families(
@@ -347,6 +360,7 @@ def _load_model_presets() -> tuple[
             weight_dtype=str(entry.get("weight_dtype", "fp8")),
             expert_dtype=str(entry.get("expert_dtype", "")),
             model_type=str(entry.get("model_type", "")),
+            has_attn_output_gate=bool(entry.get("has_attn_output_gate", False)),
         )
     aliases: dict[str, str] = {str(k): str(v) for k, v in payload["aliases"].items()}
     return presets, aliases, sources
@@ -662,6 +676,7 @@ def model_profile_from_hf_config(
         kv_dtype=kv_dtype.lower(),
         state_dtype=state_dtype.lower(),
         model_type=mtype,
+        has_attn_output_gate=bool(cfg.get("attn_output_gate", False)),
     )
 
 
