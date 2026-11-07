@@ -6,6 +6,8 @@ The pool is zeroed once before the first request, never per request. This is
 intentionally not a correctness mode or a prefix-cache implementation.
 """
 
+import functools
+
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
     DecodeBenchConnector,
     DecodeBenchConnectorMetadata,
@@ -13,6 +15,47 @@ from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import 
 from vllm.logger import init_logger
 
 logger = init_logger("vllm.synthetic_decode_connector")
+
+
+@functools.cache
+def _pool_zero_program():
+    """One program that zeroes every raw pool tensor in place.
+
+    An eager ``zero_`` writes a fresh raw tensor before releasing the old one,
+    a transient of one raw tensor that no longer fits at high pool sizes. A
+    donated op whose output XLA aliases onto its input (copy_ writeback, as in
+    the mamba state copy) writes the zeros into the pool's own buffers.
+    """
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from torch_tpu._internal import pallas
+
+    # torch_tpu infers static argnums from annotations: every operand is jax.Array.
+    def zeros(pool: jax.Array, tag: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return jnp.zeros(pool.shape, pool.dtype), tag
+
+    op = pallas.jax_op("pallas::synthetic_pool_zero", zeros, donate_argnums=(0,))
+    op.register_fake(lambda pool, tag: (torch.empty_like(pool), torch.empty_like(tag)))
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def zero_pools(pools: list[torch.Tensor], tag: torch.Tensor) -> torch.Tensor:
+        for pool in pools:
+            new_pool, tag = op(pool, tag)
+            pool.copy_(new_pool)
+        return tag
+
+    return zero_pools
+
+
+def _zero_pool_in_place(raws, synchronize_tensors):
+    import torch
+
+    # Quiescent pools: a pending write would make the donated parameters
+    # fall back to fresh pool-sized outputs.
+    synchronize_tensors(raws, wait=True)
+    tag = torch.zeros(1, dtype=torch.int32, device=raws[0].device)
+    synchronize_tensors([_pool_zero_program()(list(raws), tag), *raws], wait=True)
 
 
 class SyntheticTPUDecodeConnector(DecodeBenchConnector):
@@ -48,11 +91,9 @@ class SyntheticTPUDecodeConnector(DecodeBenchConnector):
         if not self._pool_initialized:
             from vllm_torchtpu.utils import synchronize_tensors
 
-            # After startup dummy forwards, before the first real request.
-            # Synchronize each raw tensor to bound temporary allocation size.
-            for tensor in self._runner.kv_cache_raw_tensors:
-                tensor.zero_()
-                synchronize_tensors(tensor, wait=True)
+            # After startup dummy forwards, before the first real request:
+            # their writes would otherwise stay in the first requests' blocks.
+            _zero_pool_in_place(self._runner.kv_cache_raw_tensors, synchronize_tensors)
             self._pool_initialized = True
             logger.info(
                 "SYNTHETIC_DECODE_POOL_READY raw_tensors=%d",

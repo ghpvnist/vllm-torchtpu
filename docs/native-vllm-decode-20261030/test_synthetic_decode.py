@@ -55,34 +55,29 @@ class TestSynthetic(unittest.TestCase):
         self.assertEqual(s.get_num_new_matched_tokens(req, 0), (131071, False))
 
     def test_pool_reset_once(self):
-        class Tensor:
-            zeros = 0
-
-            def zero_(self):
-                self.zeros += 1
-
+        raws = [object(), object()]
         c = C.__new__(C)
-        c._runner = NS(kv_cache_raw_tensors=[Tensor(), Tensor()])
+        c._runner = NS(kv_cache_raw_tensors=raws)
         c._pool_initialized = False
         c._connector_metadata = DecodeBenchConnectorMetadata(
             reqs_to_fill={"a": (([],), 131071)}
         )
-        calls = []
-        with patch.dict(
-            sys.modules,
-            {
-                "vllm_torchtpu.utils": NS(
-                    synchronize_tensors=lambda t, wait: calls.append(wait)
-                )
-            },
+        zeroed = []
+        sync = object()
+        with (
+            patch.dict(
+                sys.modules, {"vllm_torchtpu.utils": NS(synchronize_tensors=sync)}
+            ),
+            patch.object(
+                module, "_zero_pool_in_place", lambda r, s: zeroed.append((r, s))
+            ),
         ):
             c.start_load_kv(None)
             c._connector_metadata = DecodeBenchConnectorMetadata(
                 reqs_to_fill={"b": (([],), 131071)}
             )
             c.start_load_kv(None)
-        self.assertEqual([t.zeros for t in c._runner.kv_cache_raw_tensors], [1, 1])
-        self.assertEqual(calls, [True, True])
+        self.assertEqual(zeroed, [(raws, sync)])
 
 
 if __name__ == "__main__":
