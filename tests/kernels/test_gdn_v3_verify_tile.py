@@ -368,11 +368,22 @@ TWO_SLOT_SCHEDULES = {
 }
 
 
+# Options of the two-slot calls; "inner_ref" computes the one-block-per-
+# position reference with wrapper.inner_kernel instead of window_tile.
+TWO_SLOT_KNOBS = {
+    "plain": {},
+    "inner_ref": {},
+    "packed": dict(packed_tokens=True),
+}
+
+
+@pytest.mark.parametrize("knobs", sorted(TWO_SLOT_KNOBS))
 @pytest.mark.parametrize("schedule", sorted(TWO_SLOT_SCHEDULES))
-def test_two_slot_checkpoints_match_window_checkpoints(schedule):
+def test_two_slot_checkpoints_match_window_checkpoints(schedule, knobs, monkeypatch):
     """Two state blocks per sequence plus recomputation of accepted tokens
     give the same outputs, and the same committed state bytes, as one block
-    per window position, over steps covering every acceptance count."""
+    per window position, over steps covering every acceptance count; with
+    `knobs` on the two-slot calls only."""
     spec = TWO_SLOT_SCHEDULES[schedule]
     seqs, live = spec["seqs"], spec["live"]
     windowed = 6 if schedule == "prefill" else live
@@ -397,8 +408,14 @@ def test_two_slot_checkpoints_match_window_checkpoints(schedule):
         step4["read_offsets"] = jnp.asarray(offsets)
         step2 = dict(step, ckpt_indices=jnp.asarray(ckpt2, jnp.int32))
         step2["read_offsets"] = jnp.asarray(codes)
-        pool4, out4 = _pooled_call(pool4, step4, weights)
-        pool2, out2 = _pooled_call(pool2, dict(step2, two_slot_ckpts=True), weights)
+        if knobs == "inner_ref":
+            pool4, out4 = _inner_kernel_reference(
+                monkeypatch, _pooled_call, pool4, step4, weights
+            )
+        else:
+            pool4, out4 = _pooled_call(pool4, step4, weights)
+        step2 = dict(step2, two_slot_ckpts=True, **TWO_SLOT_KNOBS[knobs])
+        pool2, out2 = _pooled_call(pool2, step2, weights)
         _assert_same(out2, out4, f"{schedule} step {t} outputs")
         for s, want in pending.items():
             if lens[s] == 1:
@@ -430,3 +447,19 @@ def test_two_slot_checkpoints_match_window_checkpoints(schedule):
                 )
             offsets[s] = accepted if drafts else 0
             codes[s] = nxt
+
+
+@pytest.mark.parametrize("schedule", sorted(WINDOW_SCHEDULES))
+def test_packed_tokens_match_per_token_tiles(schedule):
+    # Packed activations change only the operand layout: verify windows,
+    # prefill chunks after them and one-token decodes keep every bit.
+    num_spec, steps = WINDOW_SCHEDULES[schedule]
+    seqs = len(steps[0]["lens"])
+    weights = _weights(7)
+    pool = _pool(8, 1 + seqs * (num_spec + 1) + 1)
+    ref_pool = jnp.array(pool, copy=True)
+    for i, spec in enumerate(steps):
+        step = _step(40 + i, num_spec, **spec)
+        pool, out = _pooled_call(pool, dict(step, packed_tokens=True), weights)
+        ref_pool, ref_out = _pooled_call(ref_pool, step, weights)
+        _assert_same((out, pool), (ref_out, ref_pool), f"{schedule} step {i}")

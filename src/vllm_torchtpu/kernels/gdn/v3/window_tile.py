@@ -222,9 +222,9 @@ def _store_conv_start(
 
 
 def run(
-    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] FP32
-    b_slot_ref: jax.Ref,  # [seq, chunk, 1, lanes]
-    a_slot_ref: jax.Ref,  # [seq, chunk, 1, lanes]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size] FP32 or packed tokens
+    b_slot_ref: jax.Ref | None,  # [seq, chunk, 1, lanes]; None when packed
+    a_slot_ref: jax.Ref | None,  # [seq, chunk, 1, lanes]; None when packed
     conv_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     rec_in_ref: jax.Ref,  # [seq, 1, nblocks, *block]
     out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head_dim]
@@ -292,9 +292,12 @@ def run(
             for j in range(num_replay):
                 rep_ref[idx, prev + j] = stored[j * rows : (j + 1) * rows]
                 rep_gate_ref[idx, j] = stored[gate0 + 2 * j : gate0 + 2 * j + 2]
-        tokens = qkv_slot_ref.at[idx].reshape(-1, lanes)
         for t in range(cfg.chunk_size):
-            lhs_ref[idx, prev + t] = _to_stored(tokens[pl.ds(t * rows, rows)], cfg)
+            if cfg.packed_tokens:
+                token = qkv_slot_ref[idx, t, pl.ds(0, rows)]
+            else:
+                token = qkv_slot_ref.at[idx].reshape(-1, lanes)[pl.ds(t * rows, rows)]
+            lhs_ref[idx, prev + t] = _to_stored(token, cfg)
     for k in range(ks):
         weight = weights_ref.conv.weight.at[k].reshape(-1, lanes)[...]
         conv_w_ref[k] = _to_stored(weight.astype(jnp.float32), cfg)
@@ -313,6 +316,15 @@ def run(
     dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], (0, padding_size)).reshape(1, -1)
     dt_bias = dt_bias.astype(compute)
     batched_dims = (((2,), (1,)), ((0,), (0,)))
+
+    def gate_rows(idx, t):
+        # Token t's b and a rows, [1, lanes] each.
+        if cfg.packed_tokens:
+            return (
+                qkv_slot_ref[idx, t, pl.ds(rows, 1)],
+                qkv_slot_ref[idx, t, pl.ds(rows + 1, 1)],
+            )
+        return b_slot_ref[idx, t], a_slot_ref[idx, t]
 
     def head_scalar(row, head):
         # One head lane of a gate row as [1, 1], picked like
@@ -387,12 +399,9 @@ def run(
                     [lhs_ref[idx, start + j] for j in range(prev)],
                 )
 
-            beta = jnp.where(
-                valid, jax.nn.sigmoid(b_slot_ref[idx, pos].astype(compute)), 0
-            )
-            gating = neg_a * jax.nn.softplus(
-                a_slot_ref[idx, pos].astype(compute) + dt_bias
-            )
+            b_row, a_row = gate_rows(idx, pos)
+            beta = jnp.where(valid, jax.nn.sigmoid(b_row.astype(compute)), 0)
+            gating = neg_a * jax.nn.softplus(a_row.astype(compute) + dt_bias)
             gating = jnp.exp(jnp.where(valid, gating, 0))
 
             out_rows = []
@@ -485,7 +494,7 @@ def run(
                 cfg,
                 [lhs_ref[idx, j] for j in range(prev)],
                 [lhs_ref[idx, prev + t] for t in range(num_replay)],
-                [(b_slot_ref[idx, t], a_slot_ref[idx, t]) for t in range(num_replay)],
+                [gate_rows(idx, t) for t in range(num_replay)],
             )
     for idx in seqs:
         for t in range(cfg.num_ckpt_tiles):
