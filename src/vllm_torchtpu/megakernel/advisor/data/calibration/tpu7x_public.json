@@ -25,5 +25,13 @@
       "latency_us": 11.7838,
       "n": 40336
     }
-  ]
+  ],
+  "launch_gap_us": {
+    "p50": 0.8724,
+    "p90": 1.099,
+    "n": 3,
+    "step_idle_gap_us": 104.68,
+    "num_layers_norm": 60,
+    "unit": "us_per_sublayer_boundary"
+  }
 }

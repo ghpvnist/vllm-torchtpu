@@ -136,11 +136,28 @@ def test_validation_corpus_provenance_and_tie_overlap(
     )
     assert str(split_res["verdict"]).startswith("tie(objective_split:")
 
-    # Verify a paired-corner tie names an assumed input that changes the winner
+    # Verify single-pass adaptive ring wins Decode Saturated unconditionally,
+    # while the VMEM-split boundary produces a paired-corner tie.
     sweep = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
-    tie_row = next(r for r in sweep.regimes if r.label.startswith("Decode Saturated"))
-    assert tie_row.verdict == "tie(measure: collective_latency_us)"
-    assert any(u["affects"] == "scope" for u in tie_row.unresolved_assumptions)
+    sat_row = next(r for r in sweep.regimes if r.label.startswith("Decode Saturated"))
+    assert sat_row.recommended_scope == "whole_step"
+    assert sat_row.num_vmem_splits == 1
+    tie_rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(
+            phase="decode",
+            batch=512,
+            tp=8,
+            dp=2,
+            ep=16,
+            dcp=4,
+            isl=2048,
+            context=2048,
+        ),
+        "tpu7x",
+    )
+    assert tie_rep.verdict == "tie(measure: collective_latency_us)"
+    assert any(u["affects"] == "scope" for u in tie_rep.unresolved_assumptions)
 
     # Verify public calibration loader API on chips module
     cal_path = chips.public_calibration_path("tpu7x")
@@ -155,15 +172,14 @@ def test_validation_corpus_provenance_and_tie_overlap(
         "tpu7x",
         measurements=cal_data,
     )
-    # Bundled calibration carries collective priors only.
-    assert "launch_gap_us" not in cal_data
+    # Bundled calibration carries collective and conserved launch-gap priors.
+    assert "launch_gap_us" in cal_data
     assert "step_time_us" not in cal_data
     for sub in cal_data.values():
         if isinstance(sub, dict):
-            assert "launch_gap_us" not in sub
             assert "step_time_us" not in sub
     assert cal_rep.confidence == "bounded"
-    assert cal_rep.metrics["launch_gap_us"]["tag"] == "ASSUMED"
+    assert cal_rep.metrics["launch_gap_us"]["tag"] == "MEASURED"
     assert cal_rep.metrics["collective_latency_us"]["tag"] == "MEASURED"
 
     # Non-dict JSON in calibration directory raises MegakernelConfigError
@@ -206,4 +222,39 @@ def test_advisor_cli_with_bundled_measurements(tmp_path: Path) -> None:
     payload = json.loads(out_json.read_text(encoding="utf-8"))
     assert payload["confidence"] == "bounded"
     assert payload["metrics"]["collective_latency_us"]["tag"] == "MEASURED"
-    assert payload["metrics"]["launch_gap_us"]["tag"] == "ASSUMED"
+    assert payload["metrics"]["launch_gap_us"]["tag"] == "MEASURED"
+
+
+def test_validation_corpus_zero_lower_bound_violations() -> None:
+    """Verify every silicon validation point satisfies floor <= measured step."""
+    points = _load_validation_corpus()
+    for pt in points:
+        model_name = str(pt["model"])
+        chip_name = str(pt["chip"])
+        scope_name = str(pt["scope"])
+        workload = _build_workload_from_point(pt)
+        rep = advisor.advise(model_name, workload, chip_name)
+        est = next(s for s in rep.scopes if s.scope == scope_name)
+        measured_us = float(str(pt["measured_step_us"]))
+        assert est.step_bound_us <= measured_us, (
+            f"{pt['id']}: floor {est.step_bound_us:.2f} us exceeds "
+            f"measured {measured_us:.2f} us"
+        )
+
+
+def test_qwen38_b256_directional_megakernel_win() -> None:
+    """Verify single-pass adaptive ring whole_step beats per_op at B=64 and B=256."""
+    points = {str(pt["id"]): pt for pt in _load_validation_corpus()}
+    for batch_tag in ("b64", "b256"):
+        mk_pt = points[f"qwen38_2_4t_tp32_dcp8_mk_{batch_tag}"]
+        po_pt = points[f"qwen38_2_4t_tp32_dcp8_per_op_{batch_tag}"]
+        assert float(str(mk_pt["measured_step_us"])) < float(
+            str(po_pt["measured_step_us"])
+        )
+        workload = _build_workload_from_point(mk_pt)
+        rep = advisor.advise("qwen3.8-2.4t", workload, "tpu7x")
+        ws = next(s for s in rep.scopes if s.scope == "whole_step")
+        po = next(s for s in rep.scopes if s.scope == "per_op")
+        assert ws.n_splits == 1
+        assert ws.step_bound_us < po.step_bound_us
+        assert rep.recommended_scope == "whole_step"
