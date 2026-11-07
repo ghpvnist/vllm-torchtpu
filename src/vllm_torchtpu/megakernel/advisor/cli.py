@@ -180,6 +180,7 @@ def build_calibrate_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase", choices=get_args(Phase), default="decode")
     parser.add_argument("--batch", type=int, default=None)
     parser.add_argument("--tp", type=int, default=None)
+    parser.add_argument("--num-layers", type=int, default=None)
     return parser
 
 
@@ -194,6 +195,7 @@ def _run_calibrate_cli(argv: Sequence[str]) -> int:
         phase=args.phase,
         batch=args.batch,
         tp=args.tp,
+        num_layers=args.num_layers,
     )
     return 0
 

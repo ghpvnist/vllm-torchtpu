@@ -551,3 +551,225 @@ def test_calibrate_trace_filters_by_requested_phase() -> None:
             calibrate.calibrate_trace(trace_file, phase="saturation")
     finally:
         os.unlink(trace_file)
+
+
+_CONSERVED_NUM_LAYERS = 60
+_CONSERVED_OPS_PER_STEP = 9_000
+_CONSERVED_PERF_OPS = 240
+_CONSERVED_STEP_IDLE_US = 104.68
+_CONSERVED_STEP_DUR_US = 1_004.68
+_CONSERVED_BOUNDARY_DIVISOR = 120.0
+
+
+def _populate_conserved_step(
+    lines: tuple[_MutableXLineProto, ...],
+    step_idx: int,
+    step_dur_ps: int,
+    per_op_stride_ps: int,
+    per_op_busy_ps: int,
+) -> None:
+    """Append one steady-state step and 9,000 HLO ops across device streams."""
+    host_step_line, mod_line, dev_mod_line, ops_line, async_line = lines
+    base_ps = step_idx * 2_000 * _PS_PER_US
+    st_ev = host_step_line.events.add()
+    st_ev.metadata_id = 1
+    st_ev.offset_ps = base_ps
+    st_ev.duration_ps = step_dur_ps
+    _add_int_stat(st_ev, 1, step_idx)
+    _add_str_stat(st_ev, 2, "decode")
+
+    for wrap_line in (mod_line, dev_mod_line):
+        wrap_ev = wrap_line.events.add()
+        wrap_ev.metadata_id = 1
+        wrap_ev.offset_ps = base_ps
+        wrap_ev.duration_ps = step_dur_ps
+
+    for op_idx in range(_CONSERVED_OPS_PER_STEP):
+        op_start_ps = base_ps + op_idx * per_op_stride_ps
+        op_ev = ops_line.events.add()
+        op_ev.metadata_id = 2
+        op_ev.offset_ps = op_start_ps
+        op_ev.duration_ps = per_op_busy_ps
+        if op_idx % 1_500 == 0:
+            ov_ev = async_line.events.add()
+            ov_ev.metadata_id = 3
+            ov_ev.offset_ps = op_start_ps
+            ov_ev.duration_ps = per_op_busy_ps
+
+
+def _build_conserved_xspace_bytes() -> bytes:
+    """Build a 60-layer XPlane trace with host steps and XLA Modules wrappers."""
+    xplane_pb2 = importlib.import_module("vllm_torchtpu.tools.xplane_pb2")
+    space = xplane_pb2.XSpace()
+    space.hostnames.append("tpu-worker-0")
+
+    cpu_plane = space.planes.add()
+    cpu_plane.id = 98
+    cpu_plane.name = "/host:CPU"
+    cpu_plane.event_metadata[1].id = 1
+    cpu_plane.event_metadata[1].name = "Step"
+    cpu_plane.stat_metadata[1].id = 1
+    cpu_plane.stat_metadata[1].name = "step_num"
+    cpu_plane.stat_metadata[2].id = 2
+    cpu_plane.stat_metadata[2].name = "phase"
+    host_step_line = cpu_plane.lines.add()
+    host_step_line.id = 10
+    host_step_line.name = "Steps"
+
+    mod_plane = space.planes.add()
+    mod_plane.id = 97
+    mod_plane.name = "XLA Modules"
+    mod_plane.event_metadata[1].id = 1
+    mod_plane.event_metadata[1].name = "jit_model_step"
+    mod_line = mod_plane.lines.add()
+    mod_line.id = 1
+    mod_line.name = "XLA Modules"
+
+    dev_plane = space.planes.add()
+    dev_plane.id = 1
+    dev_plane.name = "/device:TPU:0"
+    for meta_id, ev_name in (
+        (1, "jit_execute"),
+        (2, "fusion_op"),
+        (3, "async_collective_overlap"),
+    ):
+        dev_plane.event_metadata[meta_id].id = meta_id
+        dev_plane.event_metadata[meta_id].name = ev_name
+
+    dev_mod_line = dev_plane.lines.add()
+    dev_mod_line.id = 1
+    dev_mod_line.name = "XLA Modules"
+    ops_line = dev_plane.lines.add()
+    ops_line.id = 2
+    ops_line.name = "XLA Ops"
+    async_line = dev_plane.lines.add()
+    async_line.id = 3
+    async_line.name = "Async Collectives"
+
+    busy_total_us = _CONSERVED_STEP_DUR_US - _CONSERVED_STEP_IDLE_US
+    per_op_busy_ps = round(busy_total_us * _PS_PER_US / _CONSERVED_OPS_PER_STEP)
+    per_op_stride_ps = int(
+        _CONSERVED_STEP_DUR_US * _PS_PER_US // _CONSERVED_OPS_PER_STEP
+    )
+    step_dur_ps = round(_CONSERVED_STEP_DUR_US * _PS_PER_US)
+    lines = (host_step_line, mod_line, dev_mod_line, ops_line, async_line)
+    for step_idx in range(3):
+        _populate_conserved_step(
+            lines, step_idx, step_dur_ps, per_op_stride_ps, per_op_busy_ps
+        )
+    return bytes(space.SerializeToString())
+
+
+def _build_conserved_perfetto_events() -> list[dict[str, object]]:
+    """Build Perfetto trace events with host steps and module wrappers."""
+    events: list[dict[str, object]] = []
+    busy_total_us = _CONSERVED_STEP_DUR_US - _CONSERVED_STEP_IDLE_US
+    per_op_busy_us = busy_total_us / _CONSERVED_PERF_OPS
+    per_op_stride_us = _CONSERVED_STEP_DUR_US / _CONSERVED_PERF_OPS
+    for step_idx in range(3):
+        base_us = step_idx * 2_000.0
+        events.extend(
+            [
+                {
+                    "ph": "X",
+                    "name": "Step",
+                    "cat": "step",
+                    "pid": 0,
+                    "tid": 1,
+                    "ts": base_us,
+                    "dur": _CONSERVED_STEP_DUR_US,
+                    "args": {"step_num": step_idx, "phase": "decode"},
+                },
+                {
+                    "ph": "X",
+                    "name": "xla_module_step",
+                    "cat": "xla_modules",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": base_us,
+                    "dur": _CONSERVED_STEP_DUR_US,
+                },
+            ]
+        )
+        events.extend(
+            [
+                {
+                    "ph": "X",
+                    "name": f"hlo_{op_idx}",
+                    "cat": "op",
+                    "pid": 1,
+                    "tid": 2,
+                    "ts": base_us + op_idx * per_op_stride_us,
+                    "dur": per_op_busy_us,
+                }
+                for op_idx in range(_CONSERVED_PERF_OPS)
+            ]
+        )
+    return events
+
+
+def test_calibrate_xplane_conserves_step_idle_sum(tmp_path: Path) -> None:
+    """Verify XPlane and Perfetto calibration conserve total step idle gap."""
+    pb_file = tmp_path / "compiled_60l.xplane.pb"
+    pb_file.write_bytes(_build_conserved_xspace_bytes())
+    out_xplane = tmp_path / "xplane_conserved.json"
+
+    payload = advisor.calibrate_trace(
+        pb_file,
+        out_xplane,
+        chip="tpu7x",
+        model="qwen3.5-397b",
+        phase="decode",
+    )
+    lg = payload["launch_gap_us"]
+    assert lg["unit"] == "us_per_sublayer_boundary"
+    assert lg["num_layers_norm"] == _CONSERVED_NUM_LAYERS
+    assert lg["step_idle_gap_us"] == pytest.approx(_CONSERVED_STEP_IDLE_US, abs=1e-3)
+    assert lg["p50"] == pytest.approx(
+        _CONSERVED_STEP_IDLE_US / _CONSERVED_BOUNDARY_DIVISOR, abs=1e-6
+    )
+
+    rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
+        "tpu7x",
+        measurements=out_xplane,
+    )
+    per_op_est = next(s for s in rep.scopes if s.scope == "per_op")
+    total_per_op_bubble_us = per_op_est.ops_per_step * float(
+        rep.metrics["launch_gap_us"]["value"]
+    )
+    assert total_per_op_bubble_us == pytest.approx(_CONSERVED_STEP_IDLE_US, abs=1e-6)
+
+    perf_path = tmp_path / "compiled_60l_perfetto.json"
+    perf_path.write_text(
+        json.dumps({"traceEvents": _build_conserved_perfetto_events()}),
+        encoding="utf-8",
+    )
+    out_perf = tmp_path / "perfetto_conserved.json"
+    rc = advisor.main(
+        [
+            "calibrate",
+            "--trace",
+            str(perf_path),
+            "--chip",
+            "tpu7x",
+            "--num-layers",
+            str(_CONSERVED_NUM_LAYERS),
+            "--out",
+            str(out_perf),
+        ]
+    )
+    assert rc == 0
+    perf_payload = json.loads(out_perf.read_text(encoding="utf-8"))
+    perf_rep = advisor.advise(
+        "qwen3.5-397b",
+        advisor.WorkloadSpec(phase="decode", batch=16, tp=8, ep=8),
+        "tpu7x",
+        measurements=out_perf,
+    )
+    perf_per_op = next(s for s in perf_rep.scopes if s.scope == "per_op")
+    assert perf_per_op.ops_per_step * float(
+        perf_rep.metrics["launch_gap_us"]["value"]
+    ) == pytest.approx(_CONSERVED_STEP_IDLE_US, abs=1e-6)
+    assert perf_payload["launch_gap_us"]["num_layers_norm"] == _CONSERVED_NUM_LAYERS

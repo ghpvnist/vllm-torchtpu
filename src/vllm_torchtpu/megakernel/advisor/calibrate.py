@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
 from .. import errors
+from ..advisor.models import resolve_model_profile
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -84,6 +85,9 @@ class QuantileSummary(TypedDict, total=False):
     p50: float
     p90: float
     n: int
+    step_idle_gap_us: float
+    num_layers_norm: int
+    unit: str
 
 
 class CollectiveSummary(TypedDict):
@@ -137,6 +141,10 @@ _MIN_COLLECTIVE_GROUP_SIZE = 2
 _MIN_STEPS_FOR_WARMUP_DROP = 3
 _WARMUP_OUTLIER_RATIO: float = 2.0
 _MIN_EVENTS_FOR_WARMUP_DROP = 4
+_DEFAULT_CALIBRATE_LAYERS = 60
+_SUBLAYER_BOUNDARIES_PER_LAYER = 2
+_MIN_STEP_OPS_FOR_EXPLICIT_NORM = 2
+_CONSERVED_GAP_DECIMALS = 10
 _COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("all-reduce", "all-reduce"),
     ("allreduce", "all-reduce"),
@@ -185,15 +193,20 @@ class _ParsedTrace:
     events_by_stream: dict[str, list[_ComputeEvent]]
 
 
-def _percentile(sorted_vals: Sequence[float], q: float) -> float:
-    """Compute linear-interpolated quantile `q` in `[0, 1]` from sorted floats."""
+def _percentile_prec(sorted_vals: Sequence[float], q: float, ndigits: int = 4) -> float:
+    """Compute linear-interpolated quantile `q` rounded to `ndigits` decimals."""
     if not sorted_vals:
         return 0.0
     pos = q * (len(sorted_vals) - 1)
     lo = int(pos)
     hi = min(len(sorted_vals) - 1, lo + 1)
     frac = pos - lo
-    return round(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac, 4)
+    return round(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac, ndigits)
+
+
+def _percentile(sorted_vals: Sequence[float], q: float) -> float:
+    """Compute linear-interpolated quantile `q` in `[0, 1]` from sorted floats."""
+    return _percentile_prec(sorted_vals, q, 4)
 
 
 def _classify_collective(name: str) -> str | None:
@@ -205,6 +218,20 @@ def _classify_collective(name: str) -> str | None:
         if prefix in norm:
             return canonical
     return None
+
+
+def _is_module_wrapper(name: str, cat: str, line_name: str) -> bool:
+    """Return True when an event or line wraps full-step XLA modules."""
+    low_cat = cat.lower()
+    low_line = line_name.lower()
+    low_name = name.lower()
+    return (
+        "xla module" in low_line
+        or "xla_module" in low_line
+        or "xla module" in low_cat
+        or "xla_module" in low_cat
+        or low_name.startswith("xla_module")
+    )
 
 
 def _is_step_event(
@@ -278,6 +305,30 @@ def _build_compute_event(
     )
 
 
+def _propagate_perfetto_host_steps(
+    steps_by_rank: dict[str, list[_StepWindow]],
+    events_by_stream: Mapping[str, Sequence[_ComputeEvent]],
+) -> None:
+    """Attach host-PID step markers to device PIDs that lack local step tracks."""
+    compute_ranks = {ev.rank_key for evs in events_by_stream.values() for ev in evs}
+    if not compute_ranks:
+        return
+    host_steps = [
+        sw
+        for rk, steps in sorted(steps_by_rank.items())
+        if rk not in compute_ranks
+        for sw in steps
+    ]
+    if not host_steps:
+        return
+    for rk in sorted(compute_ranks):
+        if not steps_by_rank.get(rk):
+            steps_by_rank[rk] = list(host_steps)
+    for rk in list(steps_by_rank):
+        if rk not in compute_ranks:
+            del steps_by_rank[rk]
+
+
 def _parse_perfetto_file(path: Path) -> _ParsedTrace:
     """Parse a `.json` or `.json.gz` Perfetto trace into normalized streams."""
     raw_bytes = path.read_bytes()
@@ -315,13 +366,14 @@ def _parse_perfetto_file(path: Path) -> _ParsedTrace:
             steps_by_rank.setdefault(rank_key, []).append(
                 _build_step_window(start_us, dur_us, args)
             )
-        else:
+        elif not _is_module_wrapper(name, cat, ""):
             stream_key = f"{rank_key}:tid:{tid}"
             events_by_stream.setdefault(stream_key, []).append(
                 _build_compute_event(
                     (rank_key, stream_key), start_us, dur_us, name, args
                 )
             )
+    _propagate_perfetto_host_steps(steps_by_rank, events_by_stream)
     return _ParsedTrace(
         kind="perfetto",
         file_label=path.name,
@@ -381,12 +433,47 @@ def _ingest_xplane(
                 steps_by_rank.setdefault(rank_key, []).append(
                     _build_step_window(start_us, dur_us, args)
                 )
-            else:
+            elif not _is_module_wrapper(ev_name, "", line_name):
                 events_by_stream.setdefault(stream_key, []).append(
                     _build_compute_event(
                         (rank_key, stream_key), start_us, dur_us, ev_name, args
                     )
                 )
+
+
+def _extract_fallback_xplane_steps(
+    planes: Sequence[_XPlaneProto],
+) -> list[_StepWindow]:
+    """Extract step-marker spans from `/host:CPU` and `XLA Modules` planes."""
+    host_steps: list[_StepWindow] = []
+    for plane in planes:
+        pname = str(plane.name)
+        low_p = pname.lower()
+        is_host_or_mod = (
+            pname.startswith("/host:") or "xla module" in low_p or "xla_module" in low_p
+        )
+        if not is_host_or_mod:
+            continue
+        ev_meta = dict(plane.event_metadata.items())
+        stat_meta = dict(plane.stat_metadata.items())
+        for line in plane.lines:
+            line_name = str(line.name or line.display_name or "")
+            line_base_us = float(line.timestamp_ns) / _NS_PER_US
+            for ev in line.events:
+                dur_us = float(ev.duration_ps) / _PS_PER_US
+                if dur_us <= 0.0:
+                    continue
+                meta = ev_meta.get(ev.metadata_id)
+                ev_name = (
+                    str(meta.display_name or meta.name)
+                    if meta is not None
+                    else f"ev_{ev.metadata_id}"
+                )
+                args = _extract_xevent_stats(ev, stat_meta)
+                if _is_step_event(ev_name, "", line_name, args):
+                    start_us = line_base_us + float(ev.offset_ps) / _PS_PER_US
+                    host_steps.append(_build_step_window(start_us, dur_us, args))
+    return host_steps
 
 
 def _discover_xplane_files(path: Path) -> list[Path]:
@@ -422,12 +509,15 @@ def _parse_xplane_target(path: Path) -> _ParsedTrace:
     for file_idx, pb_path in enumerate(files):
         space = vars(xplane_pb2)["XSpace"]()
         space.ParseFromString(pb_path.read_bytes())
+        host_steps = _extract_fallback_xplane_steps(space.planes)
         for plane in space.planes:
             pname = str(plane.name)
             if not pname.startswith("/device:") or "sparse" in pname.lower():
                 continue
             rank_key = f"file:{file_idx}:plane:{plane.id}:{pname}"
             _ingest_xplane(plane, rank_key, steps_by_rank, events_by_stream)
+            if not steps_by_rank.get(rank_key) and host_steps:
+                steps_by_rank[rank_key] = list(host_steps)
     return _ParsedTrace(
         kind="xplane",
         file_label=path.name,
@@ -590,6 +680,81 @@ def _build_source_meta(
     return source_meta
 
 
+def _merged_busy_duration_us(
+    intervals: Sequence[tuple[float, float]],
+) -> float:
+    """Compute union duration across sorted or overlapping `(start, end)` spans."""
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals, key=lambda pair: pair[0])
+    cur_s, cur_e = ordered[0]
+    total = 0.0
+    for s_us, e_us in ordered[1:]:
+        if s_us <= cur_e:
+            cur_e = max(cur_e, e_us)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = s_us, e_us
+    return total + (cur_e - cur_s)
+
+
+def _resolve_norm_layers(model: str | None, explicit_layers: int | None) -> int:
+    """Resolve layer count for sublayer boundary normalization."""
+    if explicit_layers is not None and explicit_layers > 0:
+        return explicit_layers
+    if model is not None:
+        return resolve_model_profile(model).num_layers
+    return _DEFAULT_CALIBRATE_LAYERS
+
+
+def _compute_conserved_launch_gap(
+    events_by_stream: Mapping[str, Sequence[_ComputeEvent]],
+    eval_steps_by_rank: Mapping[str, Sequence[_StepWindow]],
+    norm_layers: int,
+    *,
+    explicit_norm: bool,
+) -> QuantileSummary | None:
+    """Normalize interval-merged step idle time by `2 * norm_layers` boundaries."""
+    events_by_rank: dict[str, list[_ComputeEvent]] = {}
+    for evs in events_by_stream.values():
+        for ev in evs:
+            events_by_rank.setdefault(ev.rank_key, []).append(ev)
+
+    boundaries = _SUBLAYER_BOUNDARIES_PER_LAYER * norm_layers
+    step_idles: list[float] = []
+    max_step_ops = 0
+    for rk in sorted(eval_steps_by_rank):
+        rk_evs = events_by_rank.get(rk, ())
+        for sw in eval_steps_by_rank[rk]:
+            clipped = [
+                (max(sw.start_us, ev.start_us), min(sw.end_us, ev.end_us))
+                for ev in rk_evs
+                if ev.end_us > sw.start_us and ev.start_us < sw.end_us
+            ]
+            max_step_ops = max(max_step_ops, len(clipped))
+            if clipped:
+                busy_us = _merged_busy_duration_us(clipped)
+                step_idles.append(max(0.0, sw.dur_us - busy_us))
+
+    use_conserved = bool(step_idles) and (
+        (explicit_norm and max_step_ops >= _MIN_STEP_OPS_FOR_EXPLICIT_NORM)
+        or max_step_ops >= boundaries
+    )
+    if not use_conserved:
+        return None
+    sorted_idles = sorted(step_idles)
+    p50_idle = _percentile_prec(sorted_idles, 0.5, _CONSERVED_GAP_DECIMALS)
+    p90_idle = _percentile_prec(sorted_idles, 0.9, _CONSERVED_GAP_DECIMALS)
+    return {
+        "p50": round(p50_idle / boundaries, _CONSERVED_GAP_DECIMALS),
+        "p90": round(p90_idle / boundaries, _CONSERVED_GAP_DECIMALS),
+        "n": len(sorted_idles),
+        "step_idle_gap_us": round(p50_idle, 4),
+        "num_layers_norm": norm_layers,
+        "unit": "us_per_sublayer_boundary",
+    }
+
+
 def calibrate_trace(
     trace_path: str | Path,
     out_path: str | Path | None = None,
@@ -647,8 +812,16 @@ def calibrate_trace(
         all_gaps.extend(gaps)
         all_collectives.extend(colls)
 
+    explicit_layers = extra_meta.get("num_layers")
+    norm_layers = _resolve_norm_layers(model, explicit_layers)
+    conserved_gap = _compute_conserved_launch_gap(
+        parsed.events_by_stream,
+        eval_steps_by_rank,
+        norm_layers,
+        explicit_norm=explicit_layers is not None,
+    )
     sorted_gaps = sorted(all_gaps)
-    launch_gap: QuantileSummary = (
+    launch_gap: QuantileSummary = conserved_gap or (
         {
             "p50": _percentile(sorted_gaps, 0.5),
             "p90": _percentile(sorted_gaps, 0.9),
