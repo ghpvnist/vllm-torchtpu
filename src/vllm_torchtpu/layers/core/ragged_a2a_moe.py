@@ -740,7 +740,7 @@ def _arrival_exchange(
     routes,
     collective_id,
     window=0,
-    prefetch=False,
+    prefetch=0,
     owner=False,
 ):
     """Dispatch, expert MLP and combine in one kernel: each routed token row
@@ -1223,7 +1223,7 @@ def ragged_a2a_moe_local(
     expert_arrival: bool = False,
     owner_combine: bool = False,
     arrival_window: int = 0,
-    arrival_prefetch: bool = False,
+    arrival_prefetch: int = 0,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -1464,7 +1464,7 @@ def ragged_a2a_moe(
     expert_arrival: bool = False,
     owner_combine: bool = False,
     arrival_window: int = 0,
-    arrival_prefetch: bool = False,
+    arrival_prefetch: int = 0,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""

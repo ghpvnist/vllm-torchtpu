@@ -1681,8 +1681,10 @@ class ArrivalRefs:
     # Groups whose sends start before the member waits for a group's rows:
     # the sends of groups below `group + window` (0: every send at entry).
     window: int = 0
-    # A group's first tile is copied in during the previous group's last tile.
-    prefetch: bool = False
+    # A group's first tile is copied in during the previous group's last tile:
+    # 0 no, 1 after that tile's gate/up projection, 2 before it (ahead of the
+    # group's weight copies, which start during the projection).
+    prefetch: int = 0
 
 
 def _axes(axis, num_members):
@@ -2085,6 +2087,21 @@ def _mlp_kernel(
 
         if arrival is not None:
             load_lhs(gm_id, slot, group_id, is_new_group, m_offset)
+            next_offset = metadata_ref.gm_id_to_m_offset[jnp.minimum(gm_id + 1, num_gm)]
+            next_offset = next_offset - next_offset % sub
+
+            def prefetch_next_group():
+                # The next group's first tile, once all of its rows have landed:
+                # the copy overlaps this tile's compute and sends.
+                @pl.when(fetch_next)
+                def _():
+                    issue_sends(next_group_id)
+                    with jax.named_scope("mlp_wait_arrival_next"):
+                        wait_arrival(next_group_id)
+                    lhs_copy(next_offset, 1 - slot).start()
+
+            if arrival.prefetch == 2:
+                prefetch_next_group()
 
         for p in range(cfgs.num_parts):
             with jax.named_scope(f"mlp_wait_up{p}"):
@@ -2104,23 +2121,13 @@ def _mlp_kernel(
                 start(up_copies(p, next_group_id))
 
         if arrival is not None:
-            next_offset = metadata_ref.gm_id_to_m_offset[jnp.minimum(gm_id + 1, num_gm)]
-            next_offset = next_offset - next_offset % sub
-
             # The next tile of the same group: its rows have all landed.
             @pl.when(jnp.logical_and(has_next, next_group_id == group_id))
             def _():
                 lhs_copy(next_offset, 1 - slot).start()
 
-            if arrival.prefetch:
-                # The next group's first tile, once all of its rows have landed:
-                # the copy overlaps this tile's down projection and sends.
-                @pl.when(fetch_next)
-                def _():
-                    issue_sends(next_group_id)
-                    with jax.named_scope("mlp_wait_arrival_next"):
-                        wait_arrival(next_group_id)
-                    lhs_copy(next_offset, 1 - slot).start()
+            if arrival.prefetch == 1:
+                prefetch_next_group()
 
         # The gate/up kernel stores its rows with `out[0] += partial` in each of
         # its gm tiles, and the next tile adds this tile's last partial sublane
@@ -2723,7 +2730,7 @@ def mlp_exchange_kernel_main(
     axis: str,
     num_members: int,
     window: int,
-    prefetch: bool,
+    prefetch: int,
 ):
     """Entry point of `gmm_v2_mlp_exchange`."""
     _mlp_kernel(
@@ -2833,7 +2840,7 @@ def gmm_v2_mlp_exchange(
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
     window: int = 0,
-    prefetch: bool = False,
+    prefetch: int = 0,
 ) -> jax.Array:
     """`gmm_v2_mlp_scatter` that also receives its lhs from the members.
 
@@ -2849,7 +2856,8 @@ def gmm_v2_mlp_exchange(
     starts the sends of groups below w at entry and those below g + w just
     before it waits for group g's rows; with 0, all at entry. With `prefetch`
     each group's first tile is copied in during the previous group's last
-    tile.
+    tile: 1 after that tile's gate/up projection, 2 before it, so the copy is
+    queued ahead of the group's weight copies.
     """
 
     size_k = tokens.shape[1]
@@ -2932,7 +2940,7 @@ def gmm_v2_mlp_exchange(
         f"gmm_v2_mlp_exchange-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
         f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
         f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
-        f"-w_{window}{'p' if prefetch else ''}"
+        f"-w_{window}{f'p{int(prefetch)}' if prefetch else ''}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     row_view = tokens.reshape(tokens.shape[0], row_sub, size_k // row_sub)

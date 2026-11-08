@@ -518,7 +518,7 @@ def test_expert_arrival_window_matches_returned_partials(
     )
     base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
     assert np.abs(base.astype(np.float32)).max() > 0
-    for window, prefetch in [(1, True), (2, True), (4, True), (0, True), (2, False)]:
+    for window, prefetch in [(1, 1), (2, 1), (4, 1), (0, 1), (2, 0), (1, 2), (4, 2)]:
         got = np.asarray(
             jax.jit(
                 functools.partial(
@@ -576,7 +576,7 @@ def test_expert_arrival_owner_matches_owner_combine(
     )
     base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
     assert np.abs(base.astype(np.float32)).max() > 0
-    for window, prefetch in [(0, False), (1, True), (2, True), (4, True)]:
+    for window, prefetch in [(0, 0), (1, 1), (4, 1), (1, 2), (4, 2)]:
         got = np.asarray(
             jax.jit(
                 functools.partial(
