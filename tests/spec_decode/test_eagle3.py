@@ -1092,6 +1092,30 @@ def test_loop_bucket_constant_under_sharded_lockstep():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_mtp_loop_bucket_pads_to_request_paddings_with_decode_req_buckets(lockstep):
+    """With partial-load decode buckets the loop pads its request count to the
+    runner's request paddings, not the (verify-sized) token buckets."""
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    req_paddings = [8, 12, 16, 18, 24]
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[24, 48, 72, 96],
+        num_reqs_paddings=req_paddings,
+        spec_loop_paddings=req_paddings,
+        max_num_reqs=24,
+        _dp_step_max_reqs=12,
+        _dp_lockstep_enabled=lambda: lockstep,
+    )
+    assert proposer._loop_paddings() == req_paddings
+    assert proposer._loop_bucket(5) == (12 if lockstep else 8)
+    assert proposer._loop_bucket(12) == 12
+    proposer.runner._dp_step_max_reqs = 17
+    assert proposer._loop_bucket(13) == (18 if lockstep else 16)
+    proposer.runner.spec_loop_paddings = None
+    assert proposer._loop_paddings() == [24, 48, 72, 96]
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("draft_tp, has_moe", [(2, False), (1, True)])
 @pytest.mark.parametrize("uses_mrope", [False, True])
 @pytest.mark.parametrize(

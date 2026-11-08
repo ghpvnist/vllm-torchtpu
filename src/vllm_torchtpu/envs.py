@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_DECODE_REQ_BUCKETS: list[int] = []
     TPU_MTP_PREFILL_ONLY: bool = False
     TPU_PP_LAZY_PUSH: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -837,6 +838,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
+    ],
+    # Requests per engine (comma list, below max-num-seqs) that get decode
+    # shapes of their own, so a partly loaded engine pads to the next listed
+    # count instead of the full batch: each is a request padding and adds the
+    # decode token bucket (r * (1 + K) under speculative decoding, else r).
+    # Under speculative decoding the draft's loop passes then pad to the
+    # request paddings instead of the token buckets. Empty: off.
+    "TPU_DECODE_REQ_BUCKETS": lambda: [
+        int(v) for v in os.getenv("TPU_DECODE_REQ_BUCKETS", "").split(",") if v.strip()
     ],
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.

@@ -1046,6 +1046,34 @@ class TPUModelRunner(GPUModelRunner):
         self.num_reqs_paddings = _get_req_paddings(
             min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
         )
+        # Partial-load decode buckets (TPU_DECODE_REQ_BUCKETS): every listed
+        # request count pads to itself and compiles its decode token bucket;
+        # under speculative decoding the draft loop pads by request count.
+        self._decode_req_buckets = sorted(
+            {r for r in envs.TPU_DECODE_REQ_BUCKETS if 0 < r < self.max_num_reqs}
+        )
+        if self._decode_req_buckets:
+            spec = vllm_config.speculative_config
+            self.num_reqs_paddings, self.num_tokens_paddings = _add_decode_req_buckets(
+                self._decode_req_buckets,
+                self.num_reqs_paddings,
+                self.num_tokens_paddings,
+                1 + (spec.num_speculative_tokens if spec else 0),
+            )
+            vllm_config.compilation_config.compile_sizes = list(
+                self.num_tokens_paddings
+            )
+            logger.info(
+                "Decode request buckets %s: request paddings %s, token buckets %s",
+                self._decode_req_buckets,
+                self.num_reqs_paddings,
+                self.num_tokens_paddings,
+            )
+        # Sizes a draft loop pass pads its request count to (None: the token
+        # buckets).
+        self.spec_loop_paddings: list[int] | None = (
+            self.num_reqs_paddings if self._decode_req_buckets else None
+        )
 
         # Capacity state exists before the first refresh; subsequent refreshes
         # run after the input batch is rebuilt during KV cache initialization.
@@ -3257,6 +3285,10 @@ class TPUModelRunner(GPUModelRunner):
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs
         )
+        if getattr(self, "_decode_req_buckets", None):
+            # Partial-load decode buckets: the smallest request padding >= n.
+            paddings = self.num_reqs_paddings
+            padded_num_reqs = paddings[bisect.bisect_left(paddings, num_reqs)]
 
         layout_plan = sequence_layout_planner.prepare_real(
             runner=self,
@@ -6057,8 +6089,9 @@ class TPUModelRunner(GPUModelRunner):
             # Prefill-only MTP consumes those same chunks on the last stage.
             drafter = getattr(self, "drafter", None)
             if isinstance(drafter, Eagle3Proposer):
-                drafter.draft_vllm_config.compilation_config.compile_sizes = list(
-                    self.num_tokens_paddings
+                drafter.draft_vllm_config.compilation_config.compile_sizes = sorted(
+                    set(self.num_tokens_paddings)
+                    | set(getattr(self, "spec_loop_paddings", None) or ())
                 )
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
@@ -7946,6 +7979,25 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
         logger.info("    %d", num)
         num = _get_padded_num_reqs_with_upper_limit(num + 1, max_req_size)
     return paddings
+
+
+def _add_decode_req_buckets(
+    req_buckets: list[int],
+    req_paddings: list[int],
+    token_paddings: list[int],
+    tokens_per_req: int,
+) -> tuple[list[int], list[int]]:
+    """Request and token paddings with each partial-load request count added:
+    as a request padding and as its decode step's token bucket."""
+    tokens = {r * tokens_per_req for r in req_buckets}
+    if max(tokens) > token_paddings[-1]:
+        raise ValueError(
+            f"TPU_DECODE_REQ_BUCKETS {req_buckets} need a {max(tokens)}-token "
+            f"bucket, above max-num-batched-tokens ({token_paddings[-1]})"
+        )
+    return sorted(set(req_paddings) | set(req_buckets)), sorted(
+        set(token_paddings) | tokens
+    )
 
 
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:

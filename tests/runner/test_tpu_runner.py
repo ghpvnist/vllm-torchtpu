@@ -444,6 +444,46 @@ def test_spec_verify_bucket_reachable_keeps_every_real_step(spec_k):
             ), (n, length, num_tokens, num_reqs)
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("spec_k", [0, 3])
+def test_decode_req_buckets_pad_partial_loads_to_their_own_shapes(spec_k):
+    # 24 requests per engine, K=3 verify buckets [96]: 12 and 18 requests get a
+    # request padding and a verify bucket of their own; without speculative
+    # decoding the decode bucket is the request count.
+    reqs, tokens = tpu_runner._add_decode_req_buckets(
+        [12, 18], [8, 16, 24], [24 * (spec_k + 1)], spec_k + 1
+    )
+    assert reqs == [8, 12, 16, 18, 24]
+    assert tokens == sorted({12 * (spec_k + 1), 18 * (spec_k + 1), 24 * (spec_k + 1)})
+
+
+@pytest.mark.cpu_test
+def test_decode_req_buckets_must_fit_max_num_batched_tokens():
+    with pytest.raises(ValueError, match="max-num-batched-tokens"):
+        tpu_runner._add_decode_req_buckets([30], [8, 16, 24], [24, 96], 4)
+
+
+@pytest.mark.parametrize("spec_k", [1, 3])
+def test_spec_verify_bucket_reachable_keeps_steps_with_decode_req_buckets(spec_k):
+    # Every padded (logits length, request) pair a verify step can reach with
+    # partial-load decode buckets survives the warmup pruning.
+    reqs, tokens = tpu_runner._add_decode_req_buckets(
+        [6, 12, 18], [8, 16, 24], [24, 24 * (spec_k + 1)], spec_k + 1
+    )
+    runner = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=spec_k),
+        num_tokens_paddings=tokens,
+        num_reqs_paddings=reqs,
+    )
+    for n in range(1, 25):
+        for length in range(n, n * (spec_k + 1) + 1):
+            num_tokens = next(p for p in tokens if p >= length)
+            num_reqs = next(p for p in reqs if p >= n)
+            assert TPUModelRunner._spec_verify_bucket_reachable(
+                runner, num_tokens, num_reqs
+            ), (n, length, num_tokens, num_reqs)
+
+
 def test_spec_verify_bucket_reachable_prunes_impossible_pairs():
     runner = _spec_bucket_runner(3)
     reachable = {

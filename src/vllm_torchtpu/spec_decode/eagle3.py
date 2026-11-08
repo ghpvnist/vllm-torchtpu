@@ -468,7 +468,7 @@ class Eagle3Proposer:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
         required_rows = _get_padded_token_len(
-            self.runner.num_tokens_paddings, self.runner.max_num_reqs
+            self._loop_paddings(), self.runner.max_num_reqs
         )
         for buf in self._mtp_topk_buffers:
             if buf.shape[0] < required_rows:
@@ -860,6 +860,13 @@ class Eagle3Proposer:
         draft_compilation_config.inductor_compile_config["_vllm_model_tag"] = (
             "eagle_head"
         )
+        loop_paddings = getattr(self.runner, "spec_loop_paddings", None)
+        if isinstance(loop_paddings, list):
+            # The draft's loop passes also run at the request paddings, which
+            # the target does not compile.
+            draft_compilation_config.compile_sizes = sorted(
+                set(draft_compilation_config.compile_sizes) | set(loop_paddings)
+            )
         self.draft_vllm_config.compilation_config = draft_compilation_config
         with (
             set_model_tag("eagle_head"),
@@ -2074,7 +2081,15 @@ class Eagle3Proposer:
                 num_reqs = runner._dp_step_max_reqs
             else:
                 num_reqs = runner.max_num_reqs
-        return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
+        return _get_padded_token_len(self._loop_paddings(), num_reqs)
+
+    def _loop_paddings(self) -> list[int]:
+        """Sizes the loop phase pads its request count to (the runner's token
+        buckets unless partial-load decode buckets give per-request ones)."""
+        paddings = getattr(self.runner, "spec_loop_paddings", None)
+        return (
+            paddings if isinstance(paddings, list) else self.runner.num_tokens_paddings
+        )
 
     def _precompile_combine_hidden_states(self) -> None:
         if self.speculative_config.method == "mtp":
@@ -2112,12 +2127,11 @@ class Eagle3Proposer:
         # pad(num_reqs), bounded by the loop bucket pad(max_num_reqs). Mirror the
         # bucket selection in _precompile_compute_logits so every sync first-pass
         # (T, p) shape-key is a startup cache hit.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        loop_paddings = self._loop_paddings()
+        max_loop_bucket = _get_padded_token_len(loop_paddings, runner.max_num_reqs)
         idx_sizes = sorted(
             set(runner.num_reqs_paddings)
-            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
+            | {t for t in loop_paddings if t <= max_loop_bucket}
         )
         with runner._precompile_timed("drafter seed_input_ids"):
             for T in runner.num_tokens_paddings:
@@ -2139,10 +2153,11 @@ class Eagle3Proposer:
         max_chunk_reqs = runner.num_reqs_max_model_len
         if runner.num_reqs_most_model_len is not None:
             max_chunk_reqs = max(max_chunk_reqs, runner.num_reqs_most_model_len)
+        loop_paddings = self._loop_paddings()
         max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, min(runner.max_num_reqs, max_chunk_reqs)
+            loop_paddings, min(runner.max_num_reqs, max_chunk_reqs)
         )
-        loop_buckets = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
+        loop_buckets = [t for t in loop_paddings if t <= max_loop_bucket]
         hidden_size = self._draft_hidden_size()
         # The DP bound spans ALL chunks, not just this chunk's requests or
         # dummy metadata capacity. Each request schedules >=1 token, and T is
@@ -2182,18 +2197,17 @@ class Eagle3Proposer:
         runner = self.runner
         hidden_size = self._draft_hidden_size()
         # compute_logits is called on (a) num_reqs buckets in the first pass and
-        # (b) the loop's padded carry = _get_padded_token_len(num_tokens_paddings,
+        # (b) the loop's padded carry = _get_padded_token_len(_loop_paddings(),
         # c.num_reqs), with c.num_reqs <= max_num_reqs. So the loop can only reach
-        # token buckets up to the one just past max_num_reqs — precompile those
+        # loop paddings up to the one just past max_num_reqs — precompile those
         # plus the num_reqs buckets. (The full num_tokens_paddings also runs up to
         # max_num_batched_tokens, compiling large [n, vocab] matmuls the loop never
         # hits.) Filtering by <= max_loop_bucket keeps every intermediate bucket
         # the loop can land on, unlike sampling only at num_reqs_paddings points.
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        loop_paddings = self._loop_paddings()
+        max_loop_bucket = _get_padded_token_len(loop_paddings, runner.max_num_reqs)
         all_sizes = set(runner.num_reqs_paddings) | {
-            t for t in runner.num_tokens_paddings if t <= max_loop_bucket
+            t for t in loop_paddings if t <= max_loop_bucket
         }
         with (
             set_model_tag("eagle_head"),
