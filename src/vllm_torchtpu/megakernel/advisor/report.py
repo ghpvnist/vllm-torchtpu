@@ -22,6 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .workbench import (
+    render_workbench_body,
+    render_workbench_css,
+    render_workbench_script,
+)
+
 from . import chips
 
 if TYPE_CHECKING:
@@ -1176,6 +1182,17 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         f"{sweep.vmem_static_mib:.1f} / {sweep.vmem_budget_mib:.1f} MiB "
         f"({sweep.dma_buffers}-slot DMA)"
     )
+    vmem_max_mib = round(chip_spec.vmem_usable_bytes / (1 << 20), 1)
+    vmem_init_mib = min(round(sweep.vmem_budget_mib, 1), vmem_max_mib)
+    wb_css = render_workbench_css()
+    wb_body = render_workbench_body(
+        model_name=sweep.model,
+        chip_name=sweep.chip,
+        layout_label=rec.label(),
+        mode_source=mode_src,
+        vmem_bounds_mib=(vmem_init_mib, vmem_max_mib),
+    )
+    wb_js = render_workbench_script()
     return f"""<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -1356,9 +1373,12 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
   .cal-source {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
   .cal-hint {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
   .prov-legend {{ display: inline-flex; gap: 6px; align-items: center; }}
+  {wb_css}
 </style>
 </head>
-<body>
+<body class="wb-mode-active">
+{wb_body}
+<div id="view-audit" class="audit-scroll-wrap view-hidden">
 <div class="container">
   <div class="report-header">
     <div>
@@ -1369,7 +1389,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
         Parallelism: <strong>{_esc(rec.label())}</strong> ({_esc(mode_src)})
       </div>
     </div>
-    <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()"
+    <button class="theme-btn" id="audit-theme-toggle" onclick="toggleTheme()"
       type="button" aria-label="Toggle theme">
       <span>&#9680;</span> Theme
     </button>
@@ -1460,6 +1480,7 @@ def render_advisor_html(sweep: AdvisorSweepReport) -> str:
     <ul>{rules_html}</ul>
   </div>
 </div>
+</div>
 <script id="advisor-data" type="application/json">{safe_json}</script>
 <script>
 function toggleTheme() {{
@@ -1478,6 +1499,7 @@ function toggleTheme() {{
     }}
   }} catch(e) {{}}
 }})();
+{wb_js}
 </script>
 </body>
 </html>
