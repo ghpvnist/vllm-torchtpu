@@ -802,6 +802,12 @@ def test_default_capacity_factors_by_placement_and_group_size():
         assert default_capacity_factors(dp_size, placement=True) == (2.0, 2.0)
     assert default_capacity_factors(16, placement=True) == (3.5, 3.5)
     assert default_capacity_factors(32, placement=True) == (6.5, 6.5)
+    # Copies of the busiest experts bring every size to x2 / x2.
+    for dp_size in (1, 8, 16, 32):
+        assert default_capacity_factors(dp_size, placement=True, copies=True) == (
+            2.0,
+            2.0,
+        )
     # 23 requests per engine with 3 drafts at TP4: 16 and 32 members.
     kw = dict(tp_size=4, num_tokens=92, topk=10, onehot_moe_permute_threshold=3840)
     rows, routes = default_capacity_factors(16, placement=True)

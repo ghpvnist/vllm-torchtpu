@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter import expert_permutation
 from vllm_torchtpu.layers.adapter.fused_moe import _decode_routed_rows
 from vllm_torchtpu.layers.core.fused_moe_gmm import resolve_onehot_permute_threshold
 from vllm_torchtpu.layers.core.ragged_a2a_moe import (
@@ -97,7 +98,9 @@ def capacity_factors(dp_size: int) -> tuple[float, float]:
     the defaults for ``dp_size`` members and the expert placement (a routes
     factor of 0 follows rows)."""
     rows, routes = default_capacity_factors(
-        dp_size, placement=bool(envs.TPU_MOE_EXPERT_PLACEMENT.strip())
+        dp_size,
+        placement=bool(envs.TPU_MOE_EXPERT_PLACEMENT.strip()),
+        copies=expert_permutation.has_copies(),
     )
     if envs.TPU_MOE_A2A_CAPACITY is not None:
         rows = envs.TPU_MOE_A2A_CAPACITY

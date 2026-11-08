@@ -109,25 +109,29 @@ def test_capacity_knobs_are_unset_unless_given(monkeypatch, name, value, expecte
 
 
 @pytest.mark.parametrize(
-    "placement,capacity,route,dp,expected",
+    "placement,copies,capacity,route,dp,expected",
     [
-        ("", None, None, 8, (2.5, 3.0)),
-        ("", None, None, 16, (2.5, 3.0)),
-        ("", None, None, 32, (2.5, 3.0)),
-        ("/tmp/placement.npz", None, None, 8, (2.0, 2.0)),
-        ("/tmp/placement.npz", None, None, 16, (3.5, 3.5)),
-        ("/tmp/placement.npz", None, None, 32, (6.5, 6.5)),
+        ("", False, None, None, 8, (2.5, 3.0)),
+        ("", False, None, None, 16, (2.5, 3.0)),
+        ("", False, None, None, 32, (2.5, 3.0)),
+        ("/tmp/placement.npz", False, None, None, 8, (2.0, 2.0)),
+        ("/tmp/placement.npz", False, None, None, 16, (3.5, 3.5)),
+        ("/tmp/placement.npz", False, None, None, 32, (6.5, 6.5)),
+        ("/tmp/copies.npz", True, None, None, 16, (2.0, 2.0)),
+        ("/tmp/copies.npz", True, None, None, 32, (2.0, 2.0)),
         # Explicit factors win either way; a routes factor of 0 follows rows.
-        ("/tmp/placement.npz", 2.5, 3.0, 8, (2.5, 3.0)),
-        ("/tmp/placement.npz", 2.0, None, 32, (2.0, 6.5)),
-        ("", 1.5, 0.0, 8, (1.5, 1.5)),
-        ("", 4.0, 5.0, 16, (4.0, 5.0)),
+        ("/tmp/placement.npz", False, 2.5, 3.0, 8, (2.5, 3.0)),
+        ("/tmp/placement.npz", False, 2.0, None, 32, (2.0, 6.5)),
+        ("/tmp/copies.npz", True, 1.5, None, 32, (1.5, 2.0)),
+        ("", False, 1.5, 0.0, 8, (1.5, 1.5)),
+        ("", False, 4.0, 5.0, 16, (4.0, 5.0)),
     ],
 )
 def test_capacity_factors_follow_placement_and_group_size_unless_set(
-    monkeypatch, placement, capacity, route, dp, expected
+    monkeypatch, placement, copies, capacity, route, dp, expected
 ):
     monkeypatch.setattr(envs, "TPU_MOE_EXPERT_PLACEMENT", placement, raising=False)
+    monkeypatch.setattr(ragged_a2a.expert_permutation, "has_copies", lambda: copies)
     monkeypatch.setattr(envs, "TPU_MOE_A2A_CAPACITY", capacity, raising=False)
     monkeypatch.setattr(envs, "TPU_MOE_A2A_ROUTE_CAPACITY", route, raising=False)
     assert ragged_a2a.capacity_factors(dp) == expected

@@ -166,7 +166,7 @@ def _unpack_routes(routes: jax.Array):
 
 
 def default_capacity_factors(
-    dp_size: int, *, placement: bool = False
+    dp_size: int, *, placement: bool = False, copies: bool = False
 ) -> tuple[float, float]:
     """Capacity factors ``(rows, routes)`` for a DP group of ``dp_size`` members.
 
@@ -181,11 +181,13 @@ def default_capacity_factors(
     Without a placement the factors stay x2.5 / x3 at every size: at 16
     members dummy-weight routing fits them, and x4 / x5 measured an 11.6%
     longer step. Real routing at 16 or more members wants a placement file or
-    explicit factors.
+    explicit factors. A placement with copies of the busiest experts in extra
+    slots (``copies``) takes x2 / x2 at every size: captured routing then
+    needs about x1.6 / x1.9 at 16 / 32 members.
     """
     if not placement:
         return 2.5, 3.0
-    if dp_size <= 8:
+    if copies or dp_size <= 8:
         return 2.0, 2.0
     if dp_size <= 16:
         return 3.5, 3.5
