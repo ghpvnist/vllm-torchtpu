@@ -89,31 +89,45 @@ def test_ragged_a2a_op_threshold_covers_the_ep_decode_step(
 
 
 @pytest.mark.parametrize(
-    "placement,rows,routes,expected",
+    "name,value,expected",
     [
-        ("", None, None, (2.5, 3.0)),
-        ("/tmp/placement.npz", None, None, (2.0, 2.0)),
-        # Explicit factors win either way.
-        ("/tmp/placement.npz", "2.5", "3", (2.5, 3.0)),
-        ("", "1.5", "0", (1.5, 0.0)),
+        ("TPU_MOE_A2A_CAPACITY", None, None),
+        ("TPU_MOE_A2A_CAPACITY", "", None),
+        ("TPU_MOE_A2A_CAPACITY", "2.5", 2.5),
+        ("TPU_MOE_A2A_ROUTE_CAPACITY", None, None),
+        ("TPU_MOE_A2A_ROUTE_CAPACITY", "0", 0.0),
     ],
 )
-def test_capacity_defaults_follow_the_expert_placement(
-    monkeypatch, placement, rows, routes, expected
+def test_capacity_knobs_are_unset_unless_given(monkeypatch, name, value, expected):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    # Read the knob itself: a monkeypatched attribute restored by an earlier
+    # test would shadow the module's lazy lookup.
+    assert envs.environment_variables[name]() == expected
+
+
+@pytest.mark.parametrize(
+    "placement,capacity,route,dp,expected",
+    [
+        ("", None, None, 8, (2.5, 3.0)),
+        ("", None, None, 16, (2.5, 3.0)),
+        ("", None, None, 32, (2.5, 3.0)),
+        ("/tmp/placement.npz", None, None, 8, (2.0, 2.0)),
+        ("/tmp/placement.npz", None, None, 16, (3.5, 3.5)),
+        ("/tmp/placement.npz", None, None, 32, (6.5, 6.5)),
+        # Explicit factors win either way; a routes factor of 0 follows rows.
+        ("/tmp/placement.npz", 2.5, 3.0, 8, (2.5, 3.0)),
+        ("/tmp/placement.npz", 2.0, None, 32, (2.0, 6.5)),
+        ("", 1.5, 0.0, 8, (1.5, 1.5)),
+        ("", 4.0, 5.0, 16, (4.0, 5.0)),
+    ],
+)
+def test_capacity_factors_follow_placement_and_group_size_unless_set(
+    monkeypatch, placement, capacity, route, dp, expected
 ):
-    monkeypatch.setenv("TPU_MOE_EXPERT_PLACEMENT", placement)
-    for name, value in (
-        ("TPU_MOE_A2A_CAPACITY", rows),
-        ("TPU_MOE_A2A_ROUTE_CAPACITY", routes),
-    ):
-        if value is None:
-            monkeypatch.delenv(name, raising=False)
-        else:
-            monkeypatch.setenv(name, value)
-    # Read the knobs themselves: a monkeypatched attribute restored by an
-    # earlier test would shadow the module's lazy lookup.
-    got = tuple(
-        envs.environment_variables[name]()
-        for name in ("TPU_MOE_A2A_CAPACITY", "TPU_MOE_A2A_ROUTE_CAPACITY")
-    )
-    assert got == expected
+    monkeypatch.setattr(envs, "TPU_MOE_EXPERT_PLACEMENT", placement, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_CAPACITY", capacity, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_A2A_ROUTE_CAPACITY", route, raising=False)
+    assert ragged_a2a.capacity_factors(dp) == expected

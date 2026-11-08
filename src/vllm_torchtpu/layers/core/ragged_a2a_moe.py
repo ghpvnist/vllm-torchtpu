@@ -165,6 +165,33 @@ def _unpack_routes(routes: jax.Array):
     return jnp.right_shift(routes, 16), weights
 
 
+def default_capacity_factors(
+    dp_size: int, *, placement: bool = False
+) -> tuple[float, float]:
+    """Capacity factors ``(rows, routes)`` for a DP group of ``dp_size`` members.
+
+    Real routing concentrates on a few experts, and the fewer experts a rank
+    holds, the further the busiest rank sits above the mean. In captured
+    top-10-of-512 decode routing at TP4 (16 / 8 / 4 experts per rank), x2.5 /
+    x3 sends about 1.5% / 48% / 89% of layer steps to the full-size exchange
+    at 8 / 16 / 32 members with linear placement. A placement balanced on
+    routing counts (``placement``) brings that to 0.1% at x2 / x2 for 8
+    members, but at 16 / 32 members its busiest rank still carries about
+    3.3x / 6.3x the mean rows, so it takes x3.5 / x3.5 and x6.5 / x6.5 there.
+    Without a placement the factors stay x2.5 / x3 at every size: at 16
+    members dummy-weight routing fits them, and x4 / x5 measured an 11.6%
+    longer step. Real routing at 16 or more members wants a placement file or
+    explicit factors.
+    """
+    if not placement:
+        return 2.5, 3.0
+    if dp_size <= 8:
+        return 2.0, 2.0
+    if dp_size <= 16:
+        return 3.5, 3.5
+    return 6.5, 6.5
+
+
 def exchange_capacity(
     *,
     dp_size: int,
