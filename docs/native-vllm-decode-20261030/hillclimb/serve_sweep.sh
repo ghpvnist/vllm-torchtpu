@@ -14,6 +14,8 @@
 #   SYNTH_ACCEPT  "" (verify drafts against the target) | comma list of per-position unconditional acceptance rates,
 #                 e.g. 0.832,0.692,0.576 (synthetic rejection: draft i is accepted with that marginal probability)
 #   MNBT          --max-num-batched-tokens
+#   DECODE_BUCKETS "" | comma list of requests per engine below GLOBAL_SEQS / engines that get decode shapes of their
+#                 own (TPU_DECODE_REQ_BUCKETS), so a partial load pads to the next listed count, not the full batch
 #   KV_BYTES      --kv-cache-memory-bytes; "auto" lets --gpu-memory-utilization size the pool
 #   ASYNC_SCHED   1 = --async-scheduling (baseline), 0 = --no-async-scheduling
 #   FUSED_EP      0 | v2 | adaptive: fused expert-parallel MoE kernel on every step (adaptive needs torch_tpu >= dev20261017)
@@ -171,7 +173,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK topology=$TPU_TOPOLOGY wrap=$TPU_TOPOLOGY_WRAP engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} a2a_async=${A2A_ASYNC:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK topology=$TPU_TOPOLOGY wrap=$TPU_TOPOLOGY_WRAP engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT decode_buckets=${DECODE_BUCKETS:-none} compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} a2a_async=${A2A_ASYNC:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \

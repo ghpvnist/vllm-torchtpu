@@ -89,6 +89,8 @@ all-to-all exchange (`MOE_A2A=1`), set `MNBT` to the decode step's tokens (reque
 | `GLOBAL_SEQS` | 96 | total concurrency; `--max-num-seqs` = `GLOBAL_SEQS / engines`; must fit the KV pool (`dp8tp4` holds at most about 18 per engine at 131K) |
 | `MTP_K` | 3 | draft tokens; `0` removes `--speculative-config`. With dummy weights the draft is never accepted, so every K > 0 is pure cost |
 | `MNBT` | 1024 | `--max-num-batched-tokens`; must be >= `max-num-seqs * (MTP_K + 1)` |
+| `DECODE_BUCKETS` | | comma list of requests per engine below `max-num-seqs`, e.g. `12,18` (`TPU_DECODE_REQ_BUCKETS`): each is a request padding with its own decode token bucket (`n * (MTP_K + 1)` tokens), so a partly loaded engine pads to the next listed count instead of the full batch; under MTP the draft's loop passes pad by request count and `max-num-seqs` is no longer a target bucket. Every added token bucket is one more resident forward program (HBM) and one more compile at boot |
+| `CLIENT_SEQS` | | client only (`bench_sweep.py`): send this many requests instead of `GLOBAL_SEQS`, a partial load on a server sized for `GLOBAL_SEQS` |
 | `KV_BYTES` | auto | explicit `--kv-cache-memory-bytes`; the baseline used 25769803776 (24 GiB) |
 | `ASYNC_SCHED` | 1 | `--async-scheduling` on/off |
 | `FUSED_EP` | 0 | `v2` or `adaptive`: one fused program per MoE layer (dispatch, expert matmuls, combine) instead of all-gather + grouped matmul + reduce-scatter, armed for every step. `adaptive` does not compile on torch_tpu 0928; it needs dev20261017 or later |
@@ -110,4 +112,4 @@ all-to-all exchange (`MOE_A2A=1`), set `MNBT` to the decode step's tokens (reque
 | `KV_MODE` | synthetic | `normal` = real prefill with prefix caching (required with real weights; measure with `../benchmark_window.py`) |
 | `EXTRA_ARGS` | | appended to `vllm serve` |
 
-Compile sizes are derived: `[max-num-seqs, max-num-seqs * (MTP_K + 1), MNBT]`.
+Compile sizes are derived: `[max-num-seqs, max-num-seqs * (MTP_K + 1), MNBT]`; with `DECODE_BUCKETS` and `MTP_K > 0`, `[max-num-seqs * (MTP_K + 1), MNBT]` plus the buckets the runner adds.

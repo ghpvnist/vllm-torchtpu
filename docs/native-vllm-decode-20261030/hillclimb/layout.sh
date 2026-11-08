@@ -3,6 +3,8 @@
 # Layout presets for the decode hill-climb. Source after env.sh:
 #   source ./layout.sh            # reads LAYOUT, GLOBAL_SEQS, MTP_K, MNBT, HOST_RANK, HOST_IPS
 # Sets: PAR_ARGS (array), HEADLESS_ARGS (array), SEQS_PER_ENGINE, COMPILE_SIZES, ENGINES (count)
+# DECODE_BUCKETS (optional) = comma list of requests per engine below max-num-seqs that get decode shapes of their own
+# (TPU_DECODE_REQ_BUCKETS), so a partly loaded engine pads to the next listed count instead of the full batch.
 # shellcheck disable=SC2034  # arrays are consumed by serve_sweep.sh after sourcing
 #
 # Four-host presets cover the 16 chips / 32 TensorCores of the 2x2x4 slice.
@@ -23,6 +25,7 @@ LAYOUT=${LAYOUT:-dp8tp4}
 GLOBAL_SEQS=${GLOBAL_SEQS:-96}
 MTP_K=${MTP_K:-3}
 MNBT=${MNBT:-1024}
+DECODE_BUCKETS=${DECODE_BUCKETS:-}
 HEADLESS_ARGS=()
 case "$LAYOUT" in
   dp8tp4|dp16tp4|dp32tp4)
@@ -79,5 +82,17 @@ if [[ "${#HOST_IPS[@]}" != "$LAYOUT_HOSTS" ]]; then
 fi
 SEQS_PER_ENGINE=$((GLOBAL_SEQS / ENGINES))
 VERIFY_TOKENS=$((SEQS_PER_ENGINE * (MTP_K + 1)))
-COMPILE_SIZES=$(python3 -c "print(sorted({$SEQS_PER_ENGINE, $VERIFY_TOKENS, $MNBT}))" | tr -d ' ')
-export LAYOUT GLOBAL_SEQS MTP_K MNBT ENGINES SEQS_PER_ENGINE COMPILE_SIZES
+if [[ -n "$DECODE_BUCKETS" ]]; then
+  for n in ${DECODE_BUCKETS//,/ }; do
+    if (( n < 1 || n >= SEQS_PER_ENGINE )); then
+      echo "DECODE_BUCKETS entries must lie in 1..$((SEQS_PER_ENGINE - 1)), got $n" >&2; return 2
+    fi
+  done
+  # The runner adds each listed count's decode shapes (TPU_DECODE_REQ_BUCKETS); the draft's loop then pads by
+  # request count, so the full batch's request count is no target bucket of its own.
+  export TPU_DECODE_REQ_BUCKETS=$DECODE_BUCKETS
+  COMPILE_SIZES=$(python3 -c "print(sorted({$VERIFY_TOKENS, $MNBT}))" | tr -d ' ')
+else
+  COMPILE_SIZES=$(python3 -c "print(sorted({$SEQS_PER_ENGINE, $VERIFY_TOKENS, $MNBT}))" | tr -d ' ')
+fi
+export LAYOUT GLOBAL_SEQS MTP_K MNBT DECODE_BUCKETS ENGINES SEQS_PER_ENGINE COMPILE_SIZES

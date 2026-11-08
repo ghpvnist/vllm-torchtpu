@@ -10,6 +10,8 @@ server (and X-data-parallel-rank for hosts that run several engines).
       --input 131072 --output 1024 --arrival-interval 0.25
 
 Reads NATIVE_HOST_IPS, NATIVE_BENCH_DATASET, NATIVE_BENCH_OUTPUT_DIR like benchmark.py.
+CLIENT_SEQS (optional) sends that many requests instead of GLOBAL_SEQS (the server's
+sizing), a partial load.
 Also records the spec-decode and step counters from /metrics before and after the
 run, so the MTP acceptance per draft position can be derived.
 """
@@ -31,6 +33,10 @@ ROOT.mkdir(parents=True, exist_ok=True)
 HOSTS = os.environ["NATIVE_HOST_IPS"].split(",")
 LAYOUT = os.environ.get("LAYOUT", "dp8tp4")
 GLOBAL_SEQS = int(os.environ.get("GLOBAL_SEQS", "96"))
+# Requests this run sends: CLIENT_SEQS below GLOBAL_SEQS is a partial load on a
+# server sized for GLOBAL_SEQS.
+SERVER_SEQS = GLOBAL_SEQS
+GLOBAL_SEQS = int(os.environ.get("CLIENT_SEQS") or GLOBAL_SEQS)
 
 # Sampling sent with every request: greedy unless BENCH_TEMPERATURE is set.
 SAMPLING = {"temperature": float(os.environ.get("BENCH_TEMPERATURE", "0") or 0)}
@@ -86,7 +92,15 @@ async def run(a):
     root = ROOT / "benchmarks" / run_id
     root.mkdir(parents=True)
     (root / "parameters.json").write_text(
-        json.dumps({**vars(a), "layout": LAYOUT, "global_seqs": GLOBAL_SEQS}, indent=2)
+        json.dumps(
+            {
+                **vars(a),
+                "layout": LAYOUT,
+                "global_seqs": GLOBAL_SEQS,
+                "server_seqs": SERVER_SEQS,
+            },
+            indent=2,
+        )
     )
     timeout = aiohttp.ClientTimeout(total=7200, sock_read=7200)
     api_hosts = sorted({HOSTS[h] for h, _ in engines})
@@ -240,6 +254,7 @@ async def run(a):
         "run_id": run_id,
         "layout": LAYOUT,
         "global_seqs": GLOBAL_SEQS,
+        "server_seqs": SERVER_SEQS,
         "engines": len(engines),
         "parameters": vars(a),
         "sampling": SAMPLING,
