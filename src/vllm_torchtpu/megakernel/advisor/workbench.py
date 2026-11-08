@@ -58,22 +58,35 @@ def _sknob(
     )
 
 
+def _mesh_axis_options() -> tuple[tuple[str, str], ...]:
+    """Return common plus invalid-probe sharding divisors for mesh dropdowns."""
+    vals = (1, 2, 3, 4, 6, 7, 8, 16, 32, 64, 128, 256, 512)
+    return tuple((str(v), str(v)) for v in vals)
+
+
 def render_workbench_css() -> str:
     """Return CSS rules for the 3-pane viewport workbench and audit switcher."""
     return """  .wb-mode-active{overflow:hidden;height:100vh;padding:0}.wb-topbar{
-  display:flex;justify-content:space-between;align-items:center;gap:12px;
-  padding:8px 16px;background:var(--card);min-height:50px;box-sizing:border-box;
-  border-bottom:1px solid var(--border)}.wb-brand h1{font-size:16px;margin:0;
-  font-weight:700}.wb-sub{font-size:11px;color:var(--muted)}.wb-top-kpis,.wb-actions{
-  display:flex;gap:8px;align-items:center}.wb-pill-kpi{font-size:11px;
-  background:var(--card-inner);border-radius:6px;padding:4px 9px;
-  border:1px solid var(--border-subtle)}.wb-pill-kpi strong{font-size:12px;
-  margin-left:4px}.wb-tab-btn{background:var(--card-inner);color:var(--text);
-  border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:12px;
-  font-weight:600;cursor:pointer}.wb-tab-btn.active{background:var(--accent);
-  color:#FFF}.wb-grid{display:grid;grid-template-columns:294px minmax(0,1fr) 340px;
-  height:calc(100vh - 51px);overflow:hidden}.wb-rail,.wb-inspector{overflow-y:auto;
-  background:var(--card);padding:10px 12px;box-sizing:border-box}.wb-rail{
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+  padding:8px 16px;background:var(--card);min-height:54px;box-sizing:border-box;
+  border-bottom:1px solid var(--border);flex-wrap:wrap}.wb-brand h1{font-size:15px;
+  margin:0;font-weight:700}.wb-sub{font-size:11px;color:var(--muted)}
+  .wb-verdict-wrap{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .wb-verdict-pill{display:inline-block;padding:4px 10px;border-radius:6px;
+  font-size:11px;font-weight:800;letter-spacing:.03em;color:#FFF;background:#059669}
+  .wb-verdict-meta{font-size:11px;color:var(--text);line-height:1.35}
+  .wb-invalid-banner{background:#7F1D1D;color:#FEE2E2;padding:7px 16px;
+  font-size:12px;font-weight:600;border-bottom:2px solid #EF4444}
+  .wb-top-kpis,.wb-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .wb-pill-kpi{font-size:11px;background:var(--card-inner);border-radius:6px;
+  padding:3px 8px;border:1px solid var(--border-subtle)}.wb-pill-kpi strong{
+  font-size:11px;margin-left:3px}.wb-tab-btn{background:var(--card-inner);
+  color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 10px;
+  font-size:12px;font-weight:600;cursor:pointer}.wb-tab-btn.active{
+  background:var(--accent);color:#FFF}.wb-grid{display:grid;
+  grid-template-columns:306px minmax(0,1fr) 352px;height:calc(100vh - 56px);
+  overflow:hidden}.wb-rail,.wb-inspector{overflow-y:auto;background:var(--card);
+  padding:10px 12px;box-sizing:border-box}.wb-rail{
   border-right:1px solid var(--border)}.wb-inspector{
   border-left:1px solid var(--border)}.wb-stage{overflow-y:auto;padding:12px 16px;
   background:var(--bg);display:flex;flex-direction:column;gap:12px;
@@ -91,14 +104,17 @@ def render_workbench_css() -> str:
   color:var(--text);border-radius:4px;padding:2px 6px;font-size:10px;font-weight:700}
   .wb-mini-btn.active-a{background:#009E73;color:#FFF;border-color:#009E73}
   .wb-mini-btn.active-b{background:#56B4E9;color:#FFF;border-color:#56B4E9}
-  .wb-knob-group{display:flex;flex-direction:column;gap:5px;padding:8px;
-  margin-bottom:8px;border-radius:6px;background:var(--card-inner);
-  border:1px solid var(--border-subtle)}.wb-knob-pair{display:grid;gap:6px;
-  grid-template-columns:1fr 1fr}.wb-knob-row{display:flex;font-size:11px;
-  flex-direction:column;gap:2px}.wb-knob-head{display:flex;color:var(--muted);
-  justify-content:space-between}.wb-knob-head span:last-child{color:var(--text);
-  font-weight:600}.wb-knob-row input[type="range"]{width:100%;margin:0;
-  accent-color:var(--accent)}.wb-knob-row select,.wb-inline-sel{font-size:11px;
+  .wb-dr-group{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;
+  margin-bottom:4px}.wb-mesh-grid{display:grid;grid-template-columns:repeat(3,1fr);
+  gap:5px;margin-top:4px}.wb-eta-details summary{cursor:pointer;font-size:11px;
+  font-weight:600;color:var(--muted);margin-bottom:4px}.wb-knob-group{display:flex;
+  flex-direction:column;gap:5px;padding:8px;margin-bottom:8px;border-radius:6px;
+  background:var(--card-inner);border:1px solid var(--border-subtle)}.wb-knob-pair{
+  display:grid;gap:6px;grid-template-columns:1fr 1fr}.wb-knob-row{display:flex;
+  font-size:11px;flex-direction:column;gap:2px}.wb-knob-head{display:flex;
+  color:var(--muted);justify-content:space-between}.wb-knob-head span:last-child{
+  color:var(--text);font-weight:600}.wb-knob-row input[type="range"]{width:100%;
+  margin:0;accent-color:var(--accent)}.wb-knob-row select,.wb-inline-sel{font-size:11px;
   background:var(--card);color:var(--text);border:1px solid var(--border);
   border-radius:4px;padding:3px 5px}.wb-panel{background:var(--card);padding:12px 14px;
   border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow)}
@@ -129,29 +145,69 @@ def render_workbench_body(
     phases = tuple((p, p) for p in ("decode", "verify", "prefill", "mixed"))
     dma_o, al_o = (("2", "2 slots"), ("3", "3 slots")), (("1", "on"), ("0", "off"))
     hw_fn = "wbOnHwControl()"
+    mesh_opts = _mesh_axis_options()
+    mesh_fn = "wbOnMeshChange()"
+    mesh_grid = (
+        '<div class="wb-mesh-grid">'
+        + _sknob("tp", "TP", "8", mesh_opts, mesh_fn)
+        + _sknob("ep", "EP", "1", mesh_opts, mesh_fn)
+        + _sknob("dp", "DP", "1", mesh_opts, mesh_fn)
+        + _sknob("pp", "PP", "1", mesh_opts, mesh_fn)
+        + _sknob("dcp", "DCP", "1", mesh_opts, mesh_fn)
+        + _sknob("pcp", "PCP", "1", mesh_opts, mesh_fn)
+        + "</div>"
+    )
     pair_wl = _sknob("phase", "Phase", "decode", phases, "wbOnPhaseChange()") + _sknob(
-        "layout", "Parallelism", l_e, ()
+        "layout", "Parallelism", l_e, (), "wbOnLayoutPresetChange()"
     )
     knobs_wl = (
         f'<div class="wb-knob-pair">{pair_wl}</div>'
+        + mesh_grid
         + _rknob("batch", "Batch Size (B)", "16", (1, 1024, 1, 16))
         + _rknob("seq-tokens", "Tokens/Seq", "1", (1, 8192, 1, 1), "wbOnSeqChange()")
-        + _rknob("context", "Context (S)", "4.0K", (512, 131072, 512, 4096))
+        + _rknob("context", "Context (S)", "4.0K", (512, 1048576, 512, 4096))
+    )
+    dr_btns = (
+        '<div class="wb-knob-head"><span>Compiler / Dispatch Regime</span>'
+        '<span class="tabular" id="lbl-dispatch-regime">compiled_xla</span></div>'
+        '<div class="wb-dr-group">'
+        '<button class="wb-mini-btn" id="btn-dr-zero" type="button" '
+        "onclick=\"wbSetDispatchRegime('zero_floor')\">Zero-Gap Floor</button>"
+        '<button class="wb-mini-btn active-a" id="btn-dr-xla" type="button" '
+        "onclick=\"wbSetDispatchRegime('compiled_xla')\">Compiled XLA</button>"
+        '<button class="wb-mini-btn" id="btn-dr-eager" type="button" '
+        "onclick=\"wbSetDispatchRegime('unfused_eager')\">Exposed Dispatch</button>"
+        "</div>"
+    )
+    eta_block = (
+        '<details class="wb-eta-details" id="wb-eta-details">'
+        "<summary>Achievable Efficiency (&eta;)</summary>"
+        + _rknob(
+            "eta-dense", "Dense Compute eta", "0.72", (0.10, 1.0, 0.02, 0.72), hw_fn
+        )
+        + _rknob("eta-moe", "Grouped MoE eta", "0.50", (0.10, 1.0, 0.02, 0.50), hw_fn)
+        + _rknob("eta-hbm", "HBM Stream eta", "0.82", (0.10, 1.0, 0.02, 0.82), hw_fn)
+        + _rknob(
+            "eta-ici", "ICI Collective eta", "0.75", (0.10, 1.0, 0.02, 0.75), hw_fn
+        )
+        + "</details>"
     )
     pair_hw = _sknob("dma", "DMA Slots", "2 slots", dma_o, hw_fn) + _sknob(
         "alias", "Scratch Alias", "enabled", al_o, hw_fn
     )
     knobs_hw = (
-        _rknob(
+        dr_btns
+        + _rknob(
             "vmem",
             f"VMEM Budget (max {vmem_max:.0f} MiB)",
             f"{vmem_init:.1f} MiB",
             (2.0, vmem_max, 0.5, vmem_init),
             hw_fn,
         )
-        + _rknob("launch-gap", "Launch Gap", "0.00 us", (0, 12, 0.01, 0), hw_fn)
+        + _rknob("launch-gap", "Launch Gap", "0.87 us", (0, 12, 0.01, 0.87), hw_fn)
         + _rknob("coll-hop", "Collective Hop", "1.00 us", (0.5, 8.0, 0.001, 1.0), hw_fn)
         + f'<div class="wb-knob-pair">{pair_hw}</div>'
+        + eta_block
     )
     sc_opts = "".join(
         f'<option value="{s}">{s}</option>'
@@ -165,13 +221,17 @@ def render_workbench_body(
     return f"""  <header class="wb-topbar" id="wb-topbar"><div class="wb-brand">
   <h1>Megakernel Fusion Workbench &middot; {m_e}</h1><div class="wb-sub">Chip:
   <strong>{c_e}</strong> &middot; Mesh: <strong id="wb-active-layout">{l_e}</strong>
-  ({s_e})</div></div><div class="wb-top-kpis">{kpis}</div><div class="wb-actions">
+  ({s_e})</div></div><div class="wb-verdict-wrap">
+  <span class="wb-verdict-pill" id="wb-verdict-pill">BUILD WHOLE_STEP</span>
+  <div class="wb-verdict-meta tabular" id="wb-verdict-summary">-</div></div>
+  <div class="wb-top-kpis">{kpis}</div><div class="wb-actions">
   <button class="wb-tab-btn active" id="btn-view-workbench" type="button"
   onclick="wbSetView('workbench')">Fusion Workbench</button><button class="wb-tab-btn"
   id="btn-view-audit" type="button" onclick="wbSetView('audit')">Audit Report &amp;
   Tables</button><button class="theme-btn" id="theme-toggle" onclick="toggleTheme()"
   type="button" aria-label="Toggle theme"><span>&#9680;</span> Theme</button></div>
-  </header><main class="wb-grid" id="view-workbench"><aside class="wb-rail"
+  </header><div id="wb-invalid-banner" class="wb-invalid-banner view-hidden"
+  role="alert"></div><main class="wb-grid" id="view-workbench"><aside class="wb-rail"
   id="wb-left-rail"><div class="wb-sec-title">1. Request Regimes ([A] vs [B])</div>
   <div style="display:flex;gap:5px;margin-bottom:4px;"><button class="wb-mini-btn"
   id="btn-swap-ab" type="button" onclick="wbSwapAB()">Swap [A]/[B]</button><button
@@ -207,10 +267,12 @@ def render_workbench_script() -> str:
     """Return ES2022 workbench script combining physics engine and SVG views."""
     ui_js = r"""
   (function() { const ENG = window.__MK_ADVISOR_ENGINE; if (!ENG) return;
-  const { DATA, CHIP, REGIMES, evaluateWorkload } = ENG;
+  const { DATA, PROF, CHIP, REGIMES, evaluateWorkload } = ENG;
   const el = id => document.getElementById(id);
   const escH = s => String(s == null ? '' : s).replace(/&/g, '&amp;')
   .replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const fmtCtx = c => c >= 1048576 ? (c / 1048576).toFixed(1) + 'M'
+  : (c / 1024).toFixed(1) + 'K';
   const rSvg = (x, y, w, h, c) => `<rect x="${x.toFixed(1)}" y="${y}" ` +
   `width="${w.toFixed(1)}" height="${h}" fill="${c}"/>`;
   const dBox = (t, tag, body) => `<div class="wb-deriv-box"><div style="display:flex;` +
@@ -218,15 +280,39 @@ def render_workbench_script() -> str:
   `prov-tag-${tag}">${tag}</span></div>${body}</div>`;
   const SCOPE_COLORS = { whole_step: '#009E73', layer_group: '#56B4E9',
   single_layer: '#E69F00', per_op: '#CC79A7' };
+  const REASON_LABELS = {
+    tp_not_power_of_two: 'TP must be a power of 2',
+    attn_heads_not_divisible_by_tp: 'Attention heads % TP != 0',
+    kv_heads_not_divisible_by_tp: 'KV heads % TP != 0',
+    dcp_not_dividing_tp: 'DCP must divide effective TP',
+    experts_not_divisible_by_ep: 'E % EP != 0',
+    ep_exceeds_slice_ranks: 'EP exceeds TP*DP*PCP slice ranks',
+    pp_exceeds_layers: 'PP exceeds model num_layers',
+    invalid_dimensions: 'Dimensions must be positive'
+  };
   const STATE = { pinA: 0, pinB: -1, customDirty: false, hwDirty: false,
-  calibrated: false, selectedTopic: { kind: 'scope', scope: 'whole_step',
-  sub: 'total' }, calSource: '', calStepTimeUs: null, launchGapHiUs: 8.0,
+  meshDirty: false, calibrated: false, dispatchRegime: 'compiled_xla',
+  selectedTopic: { kind: 'scope', scope: 'whole_step', sub: 'total' },
+  calSource: '', calStepTimeUs: null, launchGapHiUs: 1.0990,
   denseSlotBytes: 2097152, collHopHiUs: (CHIP.collective_latency_us_bracket ||
-  [1.0, 5.13])[1], expertSlotBytes: 2097152, presets: [], resetSeq: 0,
+  [1.0, 5.0])[1], expertSlotBytes: 1048576, presets: [], resetSeq: 0,
   maxVmemMib: Math.round(((CHIP.vmem_usable_bytes || 65011712) / 1048576) * 10) / 10 };
+  function ensureSelectOption(selEl, val) {
+  if (!selEl) return; const sVal = String(val);
+  if (!Array.from(selEl.options).some(o => o.value === sVal)) {
+  const opt = document.createElement('option');
+  opt.value = sVal; opt.textContent = sVal;
+  selEl.appendChild(opt); } selEl.value = sVal; }
+  function syncMeshSelects(m) {
+  for (const k of ['tp', 'ep', 'dp', 'pp', 'dcp', 'pcp']) {
+  ensureSelectOption(el('ctl-' + k), m[k] || 1); } }
   function initPresets() {
   if (el('ctl-vmem')) {
     el('ctl-vmem').min = '2'; el('ctl-vmem').max = String(STATE.maxVmemMib);
+  }
+  const r0 = REGIMES[0] || {}, rw0 = r0.workload || {};
+  if (rw0.dispatch_regime && rw0.dispatch_regime !== 'auto') {
+    STATE.dispatchRegime = rw0.dispatch_regime;
   }
   const defP = DATA.parallelism || { tp: 8, ep: 1, dp: 1, pp: 1, dcp: 1, pcp: 1 };
   const seen = new Set(), addP = (name, p) => { if (!p || !p.tp) return;
@@ -243,19 +329,27 @@ def render_workbench_script() -> str:
   const rawV = parseFloat(el('ctl-vmem').value) || DATA.vmem_budget_mib
   || STATE.maxVmemMib;
   const clampedV = Math.min(STATE.maxVmemMib, Math.max(2.0, rawV));
-  return { vmemMip: clampedV,
+  const useMan = STATE.hwDirty || STATE.calibrated;
+  const dr = useMan && !STATE.calibrated ? 'auto' : STATE.dispatchRegime;
+  const gapVal = useMan ? (parseFloat(el('ctl-launch-gap').value) || 0.0)
+  : (dr === 'zero_floor' ? 0.0 : (dr === 'compiled_xla' ? 0.8724
+  : (dr === 'unfused_eager' ? 6.0 : gapFallback)));
+  return { vmemMib: clampedV, calibrated: STATE.calibrated,
+  dispatchRegime: dr, opOverheadUs: gapVal,
   dmaBuffers: parseInt(el('ctl-dma').value, 10) || DATA.dma_buffers || 2,
-  vmemAlias: el('ctl-alias').value === '1',
-  launchGapUs: (STATE.customDirty || STATE.hwDirty || STATE.calibrated)
-  ? (parseFloat(el('ctl-launch-gap').value) || 0.0) : gapFallback,
+  vmemAlias: el('ctl-alias').value === '1', launchGapUs: gapVal,
   collHopUs: parseFloat(el('ctl-coll-hop').value) || 1.0,
+  etaDense: parseFloat(el('ctl-eta-dense').value) || 0.72,
+  etaMoeGrouped: parseFloat(el('ctl-eta-moe').value) || 0.50,
+  etaHbm: parseFloat(el('ctl-eta-hbm').value) || 0.82,
+  etaIci: parseFloat(el('ctl-eta-ici').value) || 0.75,
   launchGapHiUs: STATE.launchGapHiUs, collHopHiUs: STATE.collHopHiUs,
   denseSlotBytes: STATE.denseSlotBytes, expertSlotBytes: STATE.expertSlotBytes }; }
   function regimeToWorkload(idx) {
   const reg = REGIMES[idx] || REGIMES[0] || {}, rw = reg.workload || {};
   const ph = rw.phase || reg.phase || 'decode', seqTok = ph === 'decode' ? 1
   : (ph === 'verify' ? ((rw.spec_tokens || 1) + 1) : (rw.chunk_size || rw.isl || 1));
-  const gapDef = rw.op_overhead_us !== undefined ? rw.op_overhead_us : 0.0;
+  const gapDef = rw.op_overhead_us !== undefined ? rw.op_overhead_us : 0.8724;
   return Object.assign({ label: reg.label || 'Preset', phase: ph,
   batch: rw.batch || reg.active_tokens || 16, seqTokens: seqTok, isl: rw.isl,
   osl: rw.osl, specTokens: rw.spec_tokens,
@@ -268,30 +362,41 @@ def render_workbench_script() -> str:
   runtimeKnobs(gapDef)); }
   function currentWorkloadA() {
   const base = regimeToWorkload(STATE.pinA);
-  if (!STATE.customDirty && REGIMES[STATE.pinA]) return base;
+  if (!STATE.customDirty && !STATE.meshDirty && REGIMES[STATE.pinA]) return base;
   const p = STATE.presets[parseInt(el('ctl-layout').value, 10) || 0] || base;
+  const tp = STATE.meshDirty ? (parseInt(el('ctl-tp').value, 10) || 1) : p.tp;
+  const ep = STATE.meshDirty ? (parseInt(el('ctl-ep').value, 10) || 1) : p.ep;
+  const dp = STATE.meshDirty ? (parseInt(el('ctl-dp').value, 10) || 1) : p.dp;
+  const pp = STATE.meshDirty ? (parseInt(el('ctl-pp').value, 10) || 1) : p.pp;
+  const dcp = STATE.meshDirty ? (parseInt(el('ctl-dcp').value, 10) || 1) : p.dcp;
+  const pcp = STATE.meshDirty ? (parseInt(el('ctl-pcp').value, 10) || 1) : p.pcp;
   const phase = el('ctl-phase').value, batch = parseInt(el('ctl-batch').value, 10) || 1;
   const isCh = phase === 'prefill' || phase === 'mixed';
   const rSeq = parseInt(el('ctl-seq-tokens').value, 10) || 1;
   const seqTokens = phase === 'decode' ? 1 : rSeq;
   const ctxVal = parseInt(el('ctl-context').value, 10) || 4096;
   const same = phase === base.phase && seqTokens === base.seqTokens &&
-  ctxVal === base.context, actT = phase === 'mixed' ? batch + seqTokens
-  : batch * seqTokens, lbl = `Live (${phase} B=${batch}, seq=${seqTokens})`;
+  ctxVal === base.context, actT = Math.ceil(batch / Math.max(1, dp)) *
+  (phase === 'decode' ? 1 : seqTokens);
+  const effTp = tp === 1 ? Math.max(1, dcp) : tp;
+  const epDp = Math.max(1, Math.floor(ep / ENG.gcd(ep, effTp)));
+  const rFloor = ENG.rowFloor(PROF.expert_dtype);
+  const lbl = `Live (${phase} B=${batch}, seq=${seqTokens})`;
   return Object.assign({}, base, { label: lbl, phase, batch, seqTokens, context: ctxVal,
   chunkSize: same ? base.chunkSize : (isCh ? seqTokens : 0),
   isl: same ? base.isl : (isCh ? Math.max(seqTokens, ctxVal) : ctxVal),
   specTokens: phase === 'verify' ? Math.max(1, seqTokens - 1) : 0,
   prefixHitRate: phase === base.phase ? base.prefixHitRate : 0.0,
-  tp: p.tp, ep: p.ep, dp: p.dp, pp: p.pp, dcp: p.dcp, pcp: p.pcp,
+  tp, ep, dp, pp, dcp, pcp,
   layerGroups: (p.layerGroups && p.layerGroups.length) ? p.layerGroups
-  : base.layerGroups, moeMode: (same && batch === base.batch) ? base.moeMode
-  : (actT >= 32 ? 'grouped_on_chip' : 'masked_on_chip') },
+  : base.layerGroups, moeMode: (same && batch === base.batch && !STATE.meshDirty)
+  ? base.moeMode : (actT * epDp >= rFloor ? 'grouped_on_chip' : 'masked_on_chip') },
   runtimeKnobs(base.launchGapUs)); }
   function syncControlsFromRegime(idx) { const wl = regimeToWorkload(idx);
   el('ctl-phase').value = wl.phase; el('ctl-batch').value = Math.min(1024, wl.batch);
   el('ctl-seq-tokens').value = Math.min(8192, wl.seqTokens);
-  el('ctl-context').value = Math.min(131072, wl.context);
+  el('ctl-context').value = Math.min(1048576, wl.context);
+  syncMeshSelects(wl);
   const pIdx = STATE.presets.findIndex(p => p.tp === wl.tp && p.ep === wl.ep &&
   p.dp === wl.dp && p.pp === wl.pp && p.dcp === wl.dcp && p.pcp === wl.pcp);
   if (pIdx >= 0 && el('ctl-layout')) el('ctl-layout').value = String(pIdx);
@@ -300,25 +405,89 @@ def render_workbench_script() -> str:
   function updateControlLabels(wl) {
   el('lbl-phase').textContent = wl.phase; el('lbl-batch').textContent = wl.batch;
   el('lbl-seq-tokens').textContent = wl.seqTokens;
-  el('lbl-context').textContent = (wl.context / 1024).toFixed(1) + 'K';
-  el('lbl-vmem').textContent = wl.vmemMip.toFixed(1) + ' MiB';
+  el('lbl-context').textContent = fmtCtx(wl.context);
+  el('lbl-vmem').textContent = wl.vmemMib.toFixed(1) + ' MiB';
   el('lbl-dma').textContent = wl.dmaBuffers + ' slots';
   el('lbl-alias').textContent = wl.vmemAlias ? 'enabled' : 'disabled';
   el('lbl-launch-gap').textContent = wl.launchGapUs.toFixed(2) + ' us';
   el('lbl-coll-hop').textContent = wl.collHopUs.toFixed(2) + ' us';
+  el('lbl-dispatch-regime').textContent = wl.dispatchRegime;
+  for (const [id, mode] of [['btn-dr-zero','zero_floor'],
+  ['btn-dr-xla','compiled_xla'],['btn-dr-eager','unfused_eager']]) {
+  if (el(id)) el(id).className = 'wb-mini-btn' +
+  (STATE.dispatchRegime === mode && !STATE.hwDirty ? ' active-a' : ''); }
+  for (const k of ['tp', 'ep', 'dp', 'pp', 'dcp', 'pcp']) {
+  if (el('lbl-' + k)) el('lbl-' + k).textContent = String(wl[k]); }
+  el('lbl-eta-dense').textContent = wl.etaDense.toFixed(2);
+  el('lbl-eta-moe').textContent = wl.etaMoeGrouped.toFixed(2);
+  el('lbl-eta-hbm').textContent = wl.etaHbm.toFixed(2);
+  el('lbl-eta-ici').textContent = wl.etaIci.toFixed(2);
   const axes = [`TP${wl.tp}`]; for (const k of ['dp', 'pp', 'dcp', 'pcp', 'ep'])
   if (wl[k] > 1) axes.push(`${k.toUpperCase()}${wl[k]}`);
   const layStr = axes.join(' x ');
-  el('lbl-layout').textContent = layStr; el('wb-active-layout').textContent = layStr;
-  } function renderVmemArena(evalA) {
+  el('lbl-layout').textContent = layStr; el('wb-active-layout').textContent = layStr; }
+  function renderTopVerdictAndBanner(wlA, evalA) {
+  const pill = el('wb-verdict-pill'), sumEl = el('wb-verdict-summary');
+  const ban = el('wb-invalid-banner'); if (!pill || !sumEl || !ban) return;
+  const zeroEv = evaluateWorkload(Object.assign({}, wlA, {
+    dispatchRegime: 'zero_floor', launchGapUs: 0.0, opOverheadUs: 0.0
+  }));
+  const perOp = evalA.scopes[0], win = evalA.winner;
+  const totGain = perOp.rawStepUs - win.rawStepUs;
+  const cpGain = evalA.compilerProofGainUs;
+  const physShare = totGain > 1e-6
+    ? Math.max(0, Math.min(100, (cpGain / totGain) * 100)) : (cpGain > 0 ? 100 : 0);
+  const cpPct = perOp.pureStepUs > 1e-6 ? (cpGain / perOp.pureStepUs) * 100 : 0;
+  const isFusedWin = win.scope === 'whole_step' || win.scope === 'layer_group';
+  let vTxt = 'KEEP PER_OP', vBg = '#475569';
+  if (evalA.invalidReasons.length > 0) { vTxt = 'INVALID CONFIG'; vBg = '#DC2626'; }
+  else if (isFusedWin && (zeroEv.winner.scope === 'per_op' || cpGain <= 0.0)) {
+    vTxt = 'TUNE XLA FLAGS FIRST'; vBg = '#D97706';
+  } else if (win.scope === 'whole_step') { vTxt = 'BUILD WHOLE_STEP'; vBg = '#059669'; }
+  else if (win.scope === 'layer_group') { vTxt = 'BUILD LAYER_GROUP'; vBg = '#0284C7'; }
+  else if (win.scope === 'single_layer') {
+    vTxt = 'BUILD SINGLE_LAYER'; vBg = '#B45309';
+  }
+  pill.textContent = vTxt; pill.style.background = vBg;
+  const tCross = Math.max(1, Math.ceil(
+    ENG.rowFloor(PROF.expert_dtype) / Math.max(1, evalA.epDp)
+  ));
+  const bankM = Math.round((wlA.denseSlotBytes || 2097152) / 1048576);
+  const ebankM = Math.round((wlA.expertSlotBytes || 1048576) / 1048576);
+  sumEl.innerHTML = `Compiler-Proof Gain: <strong>${cpGain.toFixed(1)} us ` +
+  `(${cpPct.toFixed(1)}%)</strong> &middot; Physics share: ` +
+  `<strong>${physShare.toFixed(0)}%</strong> &middot; Single-pass: ` +
+  `<strong>T&le;${evalA.tWideMax}</strong> wide / ` +
+  `<strong>T&le;${evalA.tShrunkMax}</strong> shrunk &middot; ` +
+  `<code>Tiles(nbd=${win.selected_nbd}, nbe=${win.selected_nbe}, ` +
+  `bank=${bankM}MiB, ebank=${ebankM}MiB)</code>` +
+  ((PROF.num_moe_layers || 0) > 0
+    ? ` &middot; MoE: masked &lt;${tCross}, grouped &ge;${tCross}` : '');
+  const alerts = [];
+  for (const r of evalA.invalidReasons) {
+    if (r === 'hbm_pool_overflow') {
+      const uG = (evalA.hbmUsedBytes / 1e9).toFixed(1);
+      const pG = (evalA.hbmPoolCapBytes / 1e9).toFixed(1);
+      const cG = ((CHIP.hbm_capacity_bytes || 103e9) / 1e9).toFixed(1);
+      alerts.push(`HBM exceeds 80% serving pool (${uG} GB > ${pG} GB / ${cG} GB)`);
+    } else alerts.push(REASON_LABELS[r] || r);
+  }
+  if (wlA.pp > 1) {
+    alerts.push(`PP=${wlA.pp} > 1 blocks whole_step fusion across stages`);
+  }
+  if (alerts.length > 0) {
+    ban.textContent = 'FEASIBILITY RED FLAG: ' + alerts.join(' | ');
+    ban.classList.remove('view-hidden');
+  } else { ban.textContent = ''; ban.classList.add('view-hidden'); } }
+  function renderVmemArena(evalA) {
   const scopeSel = el('ctl-arena-scope').value || evalA.winner.scope;
   const sc = evalA.scopes.find(s => s.scope === scopeSel) || evalA.winner;
   const budget = Math.max(1.0, evalA.vmemBudgetMib), W = 760, padL = 16, barW = 728;
   const used = sc.dense_stage_mib + sc.expert_stage_mib + sc.op_scratch_mib +
   sc.pad_mib + sc.spine_dyn_mib + sc.op_dyn_mib, selT = STATE.selectedTopic || {};
   const px = m => (m / Math.max(budget * 1.12, used * 1.05)) * barW;
-  const blocks = [['dense','Dense Ring',sc.dense_stage_mib,'#3B82F6'],
-  ['exp','Expert Ring',sc.expert_stage_mib,'#6366F1'],
+  const blocks = [['dense',`Dense (${sc.selected_nbd})`,sc.dense_stage_mib,'#3B82F6'],
+  ['exp',`Expert (${sc.selected_nbe})`,sc.expert_stage_mib,'#6366F1'],
   ['scr','Op Scratch',sc.op_scratch_mib,'#0EA5E9'],
   ['pad','Align Reserve',sc.pad_mib,'#64748B'],
   ['spn','[T,H] Spine',sc.spine_dyn_mib,'#10B981'],
@@ -346,8 +515,9 @@ def render_workbench_script() -> str:
   `${budget.toFixed(1)} MiB</text><text x="${padL}" y="82" fill="${stCol}" ` +
   `font-size="12" font-weight="600">${stTxt} &middot; Aliasing saves ` +
   `${sc.alias_saved_kib} KiB/tok</text></svg>`; }
-  function renderScopeTimeline(evalA) { const W = 760, padL = 112, barArea = 526;
-  const feasHi = evalA.scopes.map(s => s.feasible ? s.step_upper_us : 0);
+  function renderScopeTimeline(evalA) { const W = 760, padL = 112, barArea = 510;
+  const feasHi = evalA.scopes.map(s => s.feasible
+    ? Math.max(s.step_upper_us, s.step_achievable_us) : 0);
   const maxUs = Math.max(1.0, ...feasHi) * 1.06, px = u => (u / maxUs) * barArea;
   let rows = ''; ['whole_step', 'layer_group', 'single_layer', 'per_op']
   .forEach((nm, idx) => { const s = evalA.scopes.find(x => x.scope === nm);
@@ -356,24 +526,35 @@ def render_workbench_script() -> str:
   `fill="var(--muted)" font-size="12">${s.scope}</text><text x="${padL}" ` +
   `y="${y + 18}" fill="var(--muted)" font-size="11">Infeasible: ` +
   `${escH(s.reason)}</text>`; return; }
-  const envW = px(Math.max(s.compute_us, s.hbm_us)), commW = px(s.comm_us);
+  const isFused = s.scope === 'whole_step' || s.scope === 'layer_group';
+  const coreUs = isFused
+    ? Math.max(s.compute_us, s.hbm_us, s.comm_us) : Math.max(s.compute_us, s.hbm_us);
+  const envW = px(coreUs), commW = isFused ? 0 : px(s.comm_us);
   const fdW = px(s.fill_drain_us), repW = px(s.repass_spill_us);
   const x1 = padL + envW, x2 = x1 + commW, x3 = x2 + fdW, x4 = x3 + repW;
   const hiX = padL + px(s.step_upper_us), loX = padL + px(s.step_bound_us);
-  const bars = rSvg(padL, y + 2, Math.max(1, px(s.compute_us)), 12, '#3B82F6') +
-  rSvg(padL, y + 16, Math.max(1, px(s.hbm_us)), 12, '#009E73') +
-  rSvg(x1, y + 2, commW, 26, '#E69F00') + rSvg(x2, y + 2, fdW, 26, '#56B4E9') +
-  rSvg(x3, y + 2, repW, 26, '#EF4444') +
-  rSvg(x4, y + 2, px(s.launch_us), 26, '#CC79A7');
-  rows += `<g class="wb-clickable" onclick="wbSelectTopic('scope','${s.scope}',` +
-  `'total')"><text x="10" y="${y + 15}" fill="${isWin ? '#10B981' : 'var(--text)'}"` +
+  const bars = isFused
+    ? (rSvg(padL, y + 2, Math.max(1, px(s.compute_us)), 8, '#3B82F6') +
+       rSvg(padL, y + 11, Math.max(1, px(s.hbm_us)), 8, '#009E73') +
+       rSvg(padL, y + 20, Math.max(1, px(s.comm_us)), 8, '#E69F00') +
+       rSvg(x1, y + 2, fdW, 26, '#56B4E9') + rSvg(x3, y + 2, repW, 26, '#EF4444') +
+       rSvg(x4, y + 2, px(s.launch_us), 26, '#CC79A7'))
+    : (rSvg(padL, y + 2, Math.max(1, px(s.compute_us)), 12, '#3B82F6') +
+       rSvg(padL, y + 16, Math.max(1, px(s.hbm_us)), 12, '#009E73') +
+       rSvg(x1, y + 2, commW, 26, '#E69F00') + rSvg(x2, y + 2, fdW, 26, '#56B4E9') +
+       rSvg(x3, y + 2, repW, 26, '#EF4444') +
+       rSvg(x4, y + 2, px(s.launch_us), 26, '#CC79A7'));
+  rows += `<g class="wb-clickable" onclick="showProof('${s.scope}')">` +
+  `<text x="10" y="${y + 15}" fill="${isWin ? '#10B981' : 'var(--text)'}"` +
   ` font-size="12" font-weight="${isWin ? 700 : 500}">${isWin ? '* ' : ''}` +
   `${s.scope}</text><text x="10" y="${y + 29}" fill="var(--muted)" font-size="10">` +
   `${s.ops_per_step} ops, ${s.n_splits}p</text>${bars}<line x1="${loX.toFixed(1)}"` +
   ` y1="${y + 15}" x2="${hiX.toFixed(1)}" y2="${y + 15}" stroke="var(--text)" ` +
   `stroke-width="1.5" stroke-dasharray="2,2"/><text x="${(hiX + 6).toFixed(1)}" ` +
-  `y="${y + 19}" fill="var(--text)" font-size="11" font-weight="600" class="tabular">` +
-  `${s.step_bound_us.toFixed(1)} ~ ${s.step_upper_us.toFixed(1)} us</text></g>`; });
+  `y="${y + 15}" fill="var(--text)" font-size="10" font-weight="600" class="tabular">` +
+  `${s.step_bound_us.toFixed(1)}us (ach ${s.step_achievable_us.toFixed(1)}us)</text>` +
+  `<text x="${(hiX + 6).toFixed(1)}" y="${y + 27}" fill="var(--muted)" ` +
+  `font-size="9" class="tabular">upper ${s.step_upper_us.toFixed(1)} us</text></g>`; });
   const leg = [['#3B82F6',0,'Compute'],['#009E73',78,'HBM'],
   ['#E69F00',130,'Collectives'],['#56B4E9',214,'Fill/Drain'],
   ['#EF4444',292,'Repass'],['#CC79A7',356,'Launch Gap']].map(([c, x, t]) =>
@@ -383,19 +564,28 @@ def render_workbench_script() -> str:
   `class="chart-svg" role="img" aria-label="4-Scope Step Timeline">${rows}` +
   `<g transform="translate(${padL}, 214)" font-size="10" ` +
   `fill="var(--muted)">${leg}</g></svg>`; }
+  function coreStepNoLaunch(s) {
+  const f = s.scope === 'whole_step' || s.scope === 'layer_group';
+  return f ? Math.max(s.compute_us, s.hbm_us, s.comm_us)
+    : (Math.max(s.compute_us, s.hbm_us) + s.comm_us); }
   function renderSignedWaterfall(evalA, evalB, labelB) {
   const scA = evalA.winner, perOp = evalA.scopes.find(s => s.scope === 'per_op');
   const scB = evalB ? evalB.winner : (perOp || evalA.runnerUp);
   const cmpB = evalB ? `${labelB} (${scB.scope})` : `Baseline (${scB.scope})`;
   el('wb-waterfall-title').textContent =
   `Signed Attribution: [A] ${scA.scope} vs [B] ${cmpB}`;
-  const envD = Math.max(scA.compute_us, scA.hbm_us) -
-  Math.max(scB.compute_us, scB.hbm_us), selT = STATE.selectedTopic || {};
-  const terms = [['Max(Compute, HBM) Envelope', envD],
-  ['Collective Sync & Bounce', scA.comm_us - scB.comm_us],
+  const fA = scA.scope === 'whole_step' || scA.scope === 'layer_group';
+  const fB = scB.scope === 'whole_step' || scB.scope === 'layer_group';
+  const envA = Math.max(scA.compute_us, scA.hbm_us);
+  const envB = Math.max(scB.compute_us, scB.hbm_us);
+  const commAddA = fA ? Math.max(0, scA.comm_us - envA) : scA.comm_us;
+  const commAddB = fB ? Math.max(0, scB.comm_us - envB) : scB.comm_us;
+  const selT = STATE.selectedTopic || {};
+  const terms = [['Compute/HBM Roofline Core', envA - envB],
+  ['Exposed Collective Sync & Bounce', commAddA - commAddB],
   ['Cold Pipeline Fill/Drain', scA.fill_drain_us - scB.fill_drain_us],
   ['Multi-Pass HBM Repass Spill', scA.repass_spill_us - scB.repass_spill_us],
-  ['Host Kernel Launch Gaps', scA.launch_us - scB.launch_us]];
+  ['Dispatch / Boundary Bubble', scA.launch_us - scB.launch_us]];
   const netD = scA.step_bound_us - scB.step_bound_us;
   const pct = scB.step_bound_us > 0 ? (netD / scB.step_bound_us) * 100.0 : 0.0;
   const sgn = v => (v >= 0 ? '+' : '') + v.toFixed(1);
@@ -419,48 +609,80 @@ def render_workbench_script() -> str:
   function renderDerivDrawer(wlA, evalA, evalB, lblB) {
   const selSc = (STATE.selectedTopic || {}).scope;
   const sc = evalA.scopes.find(s => s.scope === selSc) || evalA.winner;
-  const provTag = STATE.calibrated ? 'MEASURED' : 'ASSUMED';
-  const bind = sc.compute_us >= sc.hbm_us ? 'Matrix Compute' : 'HBM Stream';
+  const provTag = STATE.calibrated || wlA.dispatchRegime === 'compiled_xla'
+    ? 'MEASURED' : (wlA.dispatchRegime === 'zero_floor' ? 'DERIVED' : 'ASSUMED');
+  const isFused = sc.scope === 'whole_step' || sc.scope === 'layer_group';
+  const bind = (isFused && sc.comm_us > Math.max(sc.compute_us, sc.hbm_us))
+    ? 'ICI Collective Overlap' : (sc.compute_us >= sc.hbm_us
+    ? 'Matrix Compute' : 'HBM Weight/KV Stream');
   const cal = window.wbCalNotes ? window.wbCalNotes(sc) : { line:
-  '<span class="prov-tag prov-tag-ASSUMED">ASSUMED</span> Settle: --trace &lt;p&gt;',
+  `<span class="prov-tag ` +
+  `prov-tag-${provTag}">${provTag}</span> Settle: --trace &lt;p&gt;`,
   anc: '' }, spK = (evalA.vmemParts.spineBytes / 1024).toFixed(1);
   const opK = (evalA.vmemParts.opBytes / 1024).toFixed(1);
   const totK = (evalA.vmemParts.totalPerTokenBytes / 1024).toFixed(1);
   const focus = window.wbFocusedTopicCard ? window.wbFocusedTopicCard(wlA, evalA,
   evalB, lblB, STATE.selectedTopic, sc) : '';
-  const b1 = `<div class="kpi-sub" style="margin-top:4px;">Binding: <strong>${bind}` +
-  `</strong> &middot; Pad: <strong class="tabular">${sc.moe_flop_factor.toFixed(3)}x` +
-  `</strong></div><div class="wb-formula">t_step = max(t_comp, t_hbm) + t_comm + ` +
-  `t_fd + t_rep + N*t_gap
-= max(${sc.compute_us.toFixed(2)}, ${sc.hbm_us.toFixed(2)})` +
-  ` + ${sc.comm_us.toFixed(2)} + ${sc.fill_drain_us.toFixed(2)} + ` +
-  `${sc.repass_spill_us.toFixed(2)} + ${sc.ops_per_step}*` +
-  `${wlA.launchGapUs.toFixed(2)}
-= ${sc.step_bound_us.toFixed(2)} us ` +
-  `(upper: ${sc.step_upper_us.toFixed(2)} us)</div>`;
-  const b2 = `<div class="wb-formula">T_max = floor((B_vmem - B_static) / b_tok)
-` +
-  `B_static = ${sc.dense_stage_mib}+${sc.expert_stage_mib}+${sc.op_scratch_mib}+` +
-  `${sc.pad_mib} = ${sc.vmem_static_mib.toFixed(2)} MiB
-b_tok = ${spK}+${opK} = ` +
-  `${totK} KiB/tok -> T_max=${sc.t_vmem_max} (${sc.n_splits}p)</div>`;
-  const b3 = `<div class="wb-formula">launch_gap = ${wlA.launchGapUs.toFixed(2)} ~ ` +
-  `${STATE.launchGapHiUs.toFixed(2)} us
-coll_hop = ${wlA.collHopUs.toFixed(2)} ~ ` +
-  `${STATE.collHopHiUs.toFixed(2)} us
-w_step = ${sc.w_step_gb} GB | act = ` +
-  `${sc.act_hbm_mb} MB</div><div style="font-size:11px;margin-top:4px;">` +
-  `${cal.line}</div>`;
-  el('wb-deriv-drawer').innerHTML = focus + dBox(`Scope: ${sc.scope}`, 'DERIVED', b1) +
-  dBox('VMEM Ceiling', 'DERIVED', b2) +
-  dBox(`Priors (${sc.ops_per_step} ops)`, provTag, b3) + cal.anc; }
+  const r1 = `<div style="font-size:11px;line-height:1.4;">${isFused
+    ? `Keeps the [T, H] residual spine in VMEM across layers and overlaps compute, ` +
+      `HBM weight streaming (${sc.selected_nbd}/${sc.selected_nbe} DMA slots), ` +
+      `and intra-host ICI collectives; bound by <strong>${bind}</strong>.`
+    : `Materializes activations to HBM at ${sc.ops_per_step} kernel boundaries ` +
+      `with serial collective barriers; bound by <strong>${bind}</strong>.`}</div>`;
+  const r2 = `<div class="wb-formula">T = ${evalA.activeTokens} tok/core | ` +
+  `B_vmem = ${evalA.vmemBudgetMib.toFixed(1)} MiB | b_tok = ${totK} KiB/tok\n` +
+  `nbd=${sc.selected_nbd} (2MiB), nbe=${sc.selected_nbe} (1MiB) | ` +
+  `phi_moe = ${sc.moe_flop_factor.toFixed(3)}x\n` +
+  `eta = (dense ${wlA.etaDense.toFixed(2)}, moe ${wlA.etaMoeGrouped.toFixed(2)}, ` +
+  `hbm ${wlA.etaHbm.toFixed(2)}, ici ${wlA.etaIci.toFixed(2)})</div>`;
+  const eqStr = isFused
+    ? `t_step = max(t_comp, t_hbm, t_comm) + t_fd + t_rep + N*t_gap\n` +
+      `= max(${sc.compute_us.toFixed(2)}, ${sc.hbm_us.toFixed(2)}, ` +
+      `${sc.comm_us.toFixed(2)}) + ${sc.fill_drain_us.toFixed(2)} + ` +
+      `${sc.repass_spill_us.toFixed(2)} + ${sc.ops_per_step}*` +
+      `${evalA.launchGapLoUs.toFixed(2)}`
+    : `t_step = max(t_comp, t_hbm) + t_comm + t_fd + t_rep + N*t_gap\n` +
+      `= max(${sc.compute_us.toFixed(2)}, ${sc.hbm_us.toFixed(2)}) + ` +
+      `${sc.comm_us.toFixed(2)} + ${sc.fill_drain_us.toFixed(2)} + ` +
+      `${sc.repass_spill_us.toFixed(2)} + ${sc.ops_per_step}*` +
+      `${evalA.launchGapLoUs.toFixed(2)}`;
+  const r3 = `<div class="wb-formula">${eqStr}\n= ${sc.step_bound_us.toFixed(2)} us ` +
+  `floor | ${sc.step_achievable_us.toFixed(2)} us achievable | ` +
+  `${sc.step_upper_us.toFixed(2)} us upper\n` +
+  `T_max = floor((${evalA.vmemBudgetMib.toFixed(1)} - ` +
+  `${sc.vmem_static_mib.toFixed(2)}) MiB / (${spK}+${opK}) KiB) = ` +
+  `${sc.t_vmem_max} tok (${sc.n_splits}p)</div>`;
+  const perOp = evalA.scopes[0];
+  const cpUs = perOp.pureStepUs - sc.pureStepUs;
+  const dbUs = perOp.launch_us - sc.launch_us;
+  const totUs = cpUs + dbUs;
+  const shPct = Math.abs(totUs) > 1e-6 ? ((cpUs / totUs) * 100).toFixed(0) : '100';
+  const r4 = `<div class="wb-formula">Compiler-Proof Physics Gain: ` +
+  `${cpUs >= 0 ? '+' : ''}${cpUs.toFixed(2)} us (HBM + sync + MoE pad)\n` +
+  `Dispatch Bubble Gain: ${dbUs >= 0 ? '+' : ''}${dbUs.toFixed(2)} us ` +
+  `((${perOp.ops_per_step}-${sc.ops_per_step}) * ` +
+  `${evalA.launchGapLoUs.toFixed(2)} us)\n` +
+  `Total vs per_op: ${totUs >= 0 ? '+' : ''}${totUs.toFixed(2)} us ` +
+  `(${shPct}% compiler-proof) | w_step=${sc.w_step_gb} GB</div>` +
+  `<div style="font-size:11px;margin-top:4px;">${cal.line}</div>`;
+  el('wb-deriv-drawer').innerHTML = focus +
+  dBox(`1. Mechanism (${sc.scope})`, 'DERIVED', r1) +
+  dBox('2. Symbols & Units', 'DERIVED', r2) +
+  dBox('3. Whiteboard Equation', 'DERIVED', r3) +
+  dBox('4. Compiler-Proof vs Dispatch Split', provTag, r4) + cal.anc; }
+  window.showProof = function(key) {
+  const scNames = ['whole_step', 'layer_group', 'single_layer', 'per_op'];
+  const sc = scNames.includes(key)
+    ? key : evaluateWorkload(currentWorkloadA()).winner.scope;
+  window.wbSelectTopic('scope', sc, key); };
   function renderRegimeList() {
   const listEl = el('wb-regime-list'); if (!listEl) return;
   const vsBtn = el('btn-vs-perop');
   if (vsBtn) vsBtn.className = 'wb-mini-btn' + (STATE.pinB < 0 ? ' active-b' : '');
   listEl.innerHTML = REGIMES.map((r, i) => {
   const ev = evaluateWorkload(regimeToWorkload(i));
-  const isA = i === STATE.pinA && !STATE.customDirty, isB = i === STATE.pinB;
+  const isA = i === STATE.pinA && !STATE.customDirty && !STATE.meshDirty;
+  const isB = i === STATE.pinB;
   const cls = (isA ? ' pin-a' : '') + (isB ? ' pin-b' : '');
   const col = SCOPE_COLORS[ev.winner.scope] || '#94A3B8';
   return `<div class="wb-regime-item${cls}" onclick="wbPinRegime(${i}, 'A')">` +
@@ -473,11 +695,29 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   `wbPinRegime(${i}, 'A')">A</button><button class="wb-mini-btn` +
   `${isB ? ' active-b' : ''}" type="button" onclick="event.stopPropagation();` +
   `wbPinRegime(${i}, 'B')">B</button></div>`; }).join(''); }
+  window.wbSetDispatchRegime = function(mode) {
+  STATE.dispatchRegime = mode; STATE.hwDirty = false; STATE.calibrated = false;
+  if (mode === 'zero_floor') {
+    el('ctl-launch-gap').value = '0'; STATE.launchGapHiUs = 0.0;
+  } else if (mode === 'compiled_xla') {
+    el('ctl-launch-gap').value = '0.87'; STATE.launchGapHiUs = 1.0990;
+  } else {
+    el('ctl-launch-gap').value = '6.00'; STATE.launchGapHiUs = 8.0;
+  }
+  window.wbRenderAll(); };
+  window.wbOnLayoutPresetChange = function() {
+  const p = STATE.presets[parseInt(el('ctl-layout').value, 10) || 0];
+  if (p) syncMeshSelects(p);
+  STATE.meshDirty = false; STATE.customDirty = true; window.wbRenderAll(); };
+  window.wbOnMeshChange = function() {
+  STATE.meshDirty = true; STATE.customDirty = true; window.wbRenderAll(); };
   window.wbPinRegime = function(idx, slot) { if (slot === 'B') {
   if (STATE.pinB === idx) STATE.pinB = -1; else { STATE.pinB = idx;
   if (STATE.pinA === idx && REGIMES.length > 1) { STATE.pinA = idx === 0 ? 1 : 0;
-  STATE.customDirty = false; syncControlsFromRegime(STATE.pinA); } } } else {
-  STATE.pinA = idx; if (STATE.pinB === idx) STATE.pinB = -1; STATE.customDirty = false;
+  STATE.customDirty = false; STATE.meshDirty = false;
+  syncControlsFromRegime(STATE.pinA); } } } else {
+  STATE.pinA = idx; if (STATE.pinB === idx) STATE.pinB = -1;
+  STATE.customDirty = false; STATE.meshDirty = false;
   syncControlsFromRegime(idx);
   const winSc = evaluateWorkload(regimeToWorkload(idx)).winner.scope;
   el('ctl-arena-scope').value = winSc;
@@ -487,7 +727,8 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   if (STATE.pinB < 0 || STATE.pinB === STATE.pinA) { STATE.pinB = STATE.pinA;
   STATE.pinA = (STATE.pinA + 1) % Math.max(1, REGIMES.length); } else {
   [STATE.pinA, STATE.pinB] = [STATE.pinB, STATE.pinA]; }
-  STATE.customDirty = false; syncControlsFromRegime(STATE.pinA); window.wbRenderAll();
+  STATE.customDirty = false; STATE.meshDirty = false;
+  syncControlsFromRegime(STATE.pinA); window.wbRenderAll();
   }; window.wbClearB = function() { if (STATE.pinB < 0) {
   const arEl = el('ctl-arena-scope'), cur = arEl.value || 'whole_step';
   const nxt = cur === 'per_op' ? evaluateWorkload(currentWorkloadA()).winner.scope
@@ -496,10 +737,14 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   } else STATE.pinB = -1; window.wbRenderAll(); };
   window.wbResetSliders = function() {
   STATE.pinA = 0; STATE.pinB = -1; STATE.resetSeq = (STATE.resetSeq || 0) + 1;
-  STATE.customDirty = false; STATE.hwDirty = false; STATE.calibrated = false;
+  STATE.customDirty = false; STATE.meshDirty = false;
+  STATE.hwDirty = false; STATE.calibrated = false;
+  STATE.dispatchRegime = 'compiled_xla'; STATE.launchGapHiUs = 1.0990;
   el('ctl-vmem').value = String(Math.min(STATE.maxVmemMib,
   Math.max(2.0, DATA.vmem_budget_mib || STATE.maxVmemMib)));
   el('ctl-dma').value = String(DATA.dma_buffers || 2); el('ctl-alias').value = '1';
+  el('ctl-eta-dense').value = '0.72'; el('ctl-eta-moe').value = '0.50';
+  el('ctl-eta-hbm').value = '0.82'; el('ctl-eta-ici').value = '0.75';
   el('ctl-coll-hop').value = ((CHIP.collective_latency_s || 1e-6) * 1e6).toFixed(2);
   syncControlsFromRegime(0);
   const winSc = evaluateWorkload(regimeToWorkload(0)).winner.scope;
@@ -518,6 +763,7 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   const evalA = evaluateWorkload(wlA), hasB = STATE.pinB >= 0 && REGIMES[STATE.pinB];
   const evalB = hasB ? evaluateWorkload(regimeToWorkload(STATE.pinB)) : null;
   const lblB = hasB ? regimeToWorkload(STATE.pinB).label : '';
+  renderTopVerdictAndBanner(wlA, evalA);
   if (el('wb-ab-status')) el('wb-ab-status').innerHTML = `<strong>[A]</strong> ` +
   `${escH(wlA.label)} (${evalA.winner.scope}) vs <strong>[B]</strong> ` +
   (hasB ? `${escH(lblB)} (${evalB.winner.scope})` : 'per_op') +
@@ -550,7 +796,8 @@ w_step = ${sc.w_step_gb} GB | act = ` +
   if (el('btn-stage-arena')) el('btn-stage-arena').classList.toggle('active', isAr);
   if (el('btn-stage-phase')) el('btn-stage-phase').classList.toggle('active', !isAr); };
   window.__WB_API = { STATE, DATA, SCOPE_COLORS, escH, evaluateWorkload,
-  currentWorkloadA, regimeToWorkload, syncControlsFromRegime }; initPresets();
+  currentWorkloadA, regimeToWorkload, syncControlsFromRegime, coreStepNoLaunch };
+  initPresets();
   if (REGIMES.length > 0) syncControlsFromRegime(0);
   document.body.classList.add('wb-mode-active');"""
     return render_workbench_engine_js() + ui_js + "\n  window.wbRenderAll();\n})();\n"

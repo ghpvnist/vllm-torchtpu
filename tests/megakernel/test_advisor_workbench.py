@@ -201,6 +201,7 @@ def test_workbench_html_three_pane_landmarks_and_unique_ids(model_name: str) -> 
     assert "overflow-wrap:anywhere" in html_text
     assert 'max="1024"' in html_text
     assert 'max="8192"' in html_text
+    assert 'max="1048576"' in html_text
     assert 'step="0.01"' in html_text
     assert 'step="0.001"' in html_text
     assert _DENYLIST_RE.search(html_text) is None
@@ -232,3 +233,35 @@ def test_workbench_vmem_slider_bounded_by_chip_usable_ceiling(
     )
     assert vmem_tag in html_text
     assert 'max="96"' not in html_text
+
+
+def test_workbench_verdict_mesh_regime_and_proof_drawer_controls() -> None:
+    """Verify verdict bar, feasibility banner, mesh knobs, and proof drawer."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep_report)
+    for snippet in (
+        'id="wb-verdict-pill"',
+        'id="wb-verdict-summary"',
+        'id="wb-invalid-banner"',
+        'id="btn-dr-zero"',
+        'id="btn-dr-xla"',
+        'id="btn-dr-eager"',
+        'id="ctl-tp"',
+        'id="ctl-ep"',
+        'id="ctl-dp"',
+        'id="ctl-pp"',
+        'id="ctl-dcp"',
+        'id="ctl-pcp"',
+        'id="ctl-eta-dense"',
+        'id="ctl-eta-moe"',
+        'id="ctl-eta-hbm"',
+        'id="ctl-eta-ici"',
+        "TUNE XLA FLAGS FIRST",
+        "INVALID CONFIG",
+        "Compiler-Proof Physics Gain",
+        "expertSlotBytes: 1048576",
+        "window.showProof",
+        'max="1048576"',
+    ):
+        assert snippet in html_text
+    assert "vmemMip" not in html_text
