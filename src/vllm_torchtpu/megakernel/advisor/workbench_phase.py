@@ -29,7 +29,9 @@ def render_phase_extension_js() -> str:
     """Return ES2022 logic for 2D phase heatmap, FileReader dropzone, and export."""
     return """
   const PHASE_T_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-  const PHASE_S_GRID = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const PHASE_S_GRID = [
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 1048576
+  ];
 
   (function mountPhaseDom() {
     const railSlot = document.getElementById('wb-extra-rail-slot');
@@ -82,13 +84,13 @@ def render_phase_extension_js() -> str:
       const spK = (evalA.vmemParts.spineBytes / 1024).toFixed(1);
       const vmap = {
         dense: ['Dense Weight Ring', sc.dense_stage_mib,
-          `slots=${wlA.dmaBuffers} (knob: DMA Slots #ctl-dma)`],
+          `slots=${sc.selected_nbd} * 2 MiB (adaptive ring)`],
         exp: ['Routed Expert Ring', sc.expert_stage_mib,
-          `slots=${wlA.dmaBuffers} (knob: DMA Slots #ctl-dma)`],
+          `slots=${sc.selected_nbe} * 1 MiB (adaptive ring)`],
         scr: ['Static Op Scratch', sc.op_scratch_mib,
-          'attention/GDN/MoE tile scratch'],
-        pad: ['Compiler Spill & Align Reserve', sc.pad_mib,
-          'scoped VMEM alignment reserve'],
+          'sequential attention / linear / FFN tile scratch'],
+        pad: ['Arena Alignment Reserve', sc.pad_mib,
+          '2.0 MiB on-chip arena alignment reserve'],
         spn: ['Dynamic [T, H] Residual Spine', sc.spine_dyn_mib,
           `T=${evalA.activeTokens} tok * ${spK} KiB/tok`],
         tok: ['Dynamic Per-Token Op Scratch', sc.op_dyn_mib,
@@ -107,16 +109,21 @@ def render_phase_extension_js() -> str:
       const scB = evalB ? evalB.winner : (perOp || evalA.runnerUp);
       const cmpLbl = evalB ? `${lblB} (${scB.scope})` : `Baseline (${scB.scope})`;
       const idx = parseInt(topic.sub || '0', 10) || 0;
+      const envA = Math.max(sc.compute_us, sc.hbm_us);
+      const envB = Math.max(scB.compute_us, scB.hbm_us);
+      const fA = sc.scope === 'whole_step' || sc.scope === 'layer_group';
+      const fB = scB.scope === 'whole_step' || scB.scope === 'layer_group';
+      const cA = fA ? Math.max(0, sc.comm_us - envA) : sc.comm_us;
+      const cB = fB ? Math.max(0, scB.comm_us - envB) : scB.comm_us;
       const rows = [
-        ['Max(Compute, HBM) Envelope', Math.max(sc.compute_us, sc.hbm_us),
-          Math.max(scB.compute_us, scB.hbm_us), 'max(t_comp, t_hbm) overlap floor'],
-        ['Collective Sync & Bounce', sc.comm_us, scB.comm_us,
-          'AllReduce + AllToAll + PP link hops (knob: #ctl-coll-hop)'],
+        ['Compute/HBM Roofline Core', envA, envB, 'max(t_comp, t_hbm) overlap floor'],
+        ['Exposed Collective Sync & Bounce', cA, cB,
+          'Exposed ICI/DCN sync beyond compute/HBM overlap (#ctl-coll-hop)'],
         ['Cold Pipeline Fill/Drain', sc.fill_drain_us, scB.fill_drain_us,
-          'Cold HBM slot fill + epilogue drain across fused boundaries'],
+          'Cold HBM slot fill + synchronous stage barriers'],
         ['Multi-Pass HBM Repass Spill', sc.repass_spill_us, scB.repass_spill_us,
           `n_splits=${sc.n_splits} vs ${scB.n_splits} (knob: #ctl-vmem)`],
-        ['Host Kernel Launch Gaps', sc.launch_us, scB.launch_us,
+        ['Dispatch / Boundary Bubble', sc.launch_us, scB.launch_us,
           `ops=${sc.ops_per_step} vs ${scB.ops_per_step} * gap (#ctl-launch-gap)`]
       ];
       const r = rows[idx] || rows[0];
@@ -131,13 +138,24 @@ def render_phase_extension_js() -> str:
     return '';
   };
 
+  function resolveEpDpAndRowFloor(wlBase) {
+    const ENG = window.__MK_ADVISOR_ENGINE;
+    const tp = Math.max(1, wlBase.tp || 1), dcp = Math.max(1, wlBase.dcp || 1);
+    const ep = Math.max(1, wlBase.ep || 1);
+    const effTp = tp === 1 ? Math.max(1, dcp) : tp;
+    const epDp = Math.max(1, Math.floor(ep / ENG.gcd(ep, effTp)));
+    const rFloor = ENG.rowFloor(ENG.PROF.expert_dtype);
+    return { epDp, rFloor };
+  }
+
   function buildLiveBucketSchedule(wlBase) {
     const intervals = [];
     let cur = null;
+    const { epDp, rFloor } = resolveEpDpAndRowFloor(wlBase);
     for (const tVal of PHASE_T_GRID) {
       const wl = Object.assign({}, wlBase, {
         phase: 'decode', batch: tVal, seqTokens: 1,
-        moeMode: tVal >= 32 ? 'grouped_on_chip' : 'masked_on_chip'
+        moeMode: (tVal * epDp >= rFloor) ? 'grouped_on_chip' : 'masked_on_chip'
       });
       const res = window.__WB_API.evaluateWorkload(wl);
       const win = res.winner;
@@ -197,6 +215,10 @@ def render_phase_extension_js() -> str:
     window.wbRenderAll();
   };
 
+  function fmtPhaseCtx(sVal) {
+    return sVal >= 1048576 ? (sVal / 1048576) + 'M' : (sVal / 1024) + 'K';
+  }
+
   window.wbRenderPhaseExtension = function(wlA, evalA) {
     const mapEl = document.getElementById('wb-phase-map-svg');
     const preEl = document.getElementById('wb-bucket-schedule-pre');
@@ -204,33 +226,47 @@ def render_phase_extension_js() -> str:
     const colors = window.__WB_API.SCOPE_COLORS || {};
     const W = 760, padL = 72, padT = 28, cellW = 64, cellH = 26;
     const actT = evalA ? evalA.activeTokens : wlA.batch;
+    const { epDp, rFloor } = resolveEpDpAndRowFloor(wlA);
     let cells = '';
     PHASE_S_GRID.forEach((sVal, rIdx) => {
       const y = padT + (PHASE_S_GRID.length - 1 - rIdx) * cellH;
+      const sLbl = fmtPhaseCtx(sVal);
       cells += `<text x="${padL - 8}" y="${y + 17}" text-anchor="end" ` +
-        `fill="var(--muted)" font-size="11" class="tabular">` +
-        `${sVal / 1024}K</text>`;
+        `fill="var(--muted)" font-size="11" class="tabular">${sLbl}</text>`;
       PHASE_T_GRID.forEach((tVal, cIdx) => {
         const x = padL + cIdx * cellW;
         const wl = Object.assign({}, wlA, {
           phase: 'decode', batch: tVal, seqTokens: 1, context: sVal,
-          moeMode: tVal >= 32 ? 'grouped_on_chip' : 'masked_on_chip'
+          moeMode: (tVal * epDp >= rFloor) ? 'grouped_on_chip' : 'masked_on_chip'
         });
         const ev = window.__WB_API.evaluateWorkload(wl);
-        const col = colors[ev.winner.scope] || '#64748B';
-        const shortSc = ev.winner.scope === 'whole_step' ? 'WS'
+        const isOom = Boolean(
+          ev.hbmPoolOverflow || !ev.hbmFits ||
+          (ev.invalidReasons && ev.invalidReasons.includes('hbm_pool_overflow'))
+        );
+        const col = isOom
+          ? 'url(#wb-oom-hatch)'
+          : (colors[ev.winner.scope] || '#64748B');
+        const shortSc = isOom ? 'OOM'
+          : (ev.winner.scope === 'whole_step' ? 'WS'
           : (ev.winner.scope === 'layer_group' ? 'LG'
-          : (ev.winner.scope === 'single_layer' ? '1L' : 'OP'));
-        const tieMark = ev.marginPct < 5.0 ? '*' : '';
+          : (ev.winner.scope === 'single_layer' ? '1L' : 'OP')));
+        const tieMark = (!isOom && ev.marginPct < 5.0) ? '*' : '';
         const isAct = tVal === actT && sVal === wlA.context;
         const stk = isAct ? ' stroke="#FFFFFF" stroke-width="2.2"' : '';
         const esc = window.__WB_API.escH || String;
-        const tip = esc(`T=${tVal}, S=${sVal / 1024}K -> ${ev.winner.scope} ` +
-          `(${ev.moeModeRec}), floor=${ev.winner.step_bound_us} us`);
+        const hbmG = (ev.hbmUsedBytes / 1e9).toFixed(1);
+        const wSc = ev.winner.scope;
+        const wFl = ev.winner.step_bound_us;
+        const tip = esc(
+          isOom
+            ? `T=${tVal}, S=${sLbl} -> OOM > 80% HBM (${hbmG} GB)`
+            : `T=${tVal}, S=${sLbl} -> ${wSc} (${ev.moeModeRec}), floor=${wFl} us`
+        );
         cells += `<g class="wb-clickable" ` +
           `onclick="wbSelectPhaseCell(${tVal},${sVal})">` +
           `<rect x="${x + 1}" y="${y + 1}" width="${cellW - 2}" ` +
-          `height="${cellH - 2}" rx="3" fill="${col}" fill-opacity="0.84"${stk}>` +
+          `height="${cellH - 2}" rx="3" fill="${col}" fill-opacity="0.88"${stk}>` +
           `<title>${tip}</title></rect>` +
           `<text x="${x + cellW / 2}" y="${y + 17}" text-anchor="middle" ` +
           `fill="#FFFFFF" font-size="10" font-weight="700">` +
@@ -244,11 +280,16 @@ def render_phase_extension_js() -> str:
       `class="tabular">${tVal}</text>`
     ).join('');
     const svgH = padT + PHASE_S_GRID.length * cellH + 38;
+    const defs = '<defs><pattern id="wb-oom-hatch" width="8" height="8" ' +
+      'patternUnits="userSpaceOnUse" patternTransform="rotate(45)">' +
+      '<rect width="8" height="8" fill="#7F1D1D"/>' +
+      '<line x1="0" y1="0" x2="0" y2="8" stroke="#EF4444" stroke-width="3"/>' +
+      '</pattern></defs>';
     mapEl.innerHTML = `<svg viewBox="0 0 ${W} ${svgH}" class="chart-svg" ` +
-      `role="img" aria-label="2D Winning-Scope Phase Map">` +
+      `role="img" aria-label="2D Winning-Scope Phase Map">${defs}` +
       `<text x="${padL}" y="16" fill="var(--muted)" font-size="11">` +
-      `Y: Context Length (tokens) | X: Active Tokens per Step (T) | ` +
-      `* = close margin (&lt;5%)</text>${cells}${xTicks}</svg>`;
+      `Y: Context Length | X: Active Tokens (T) | * = &lt;5% margin | ` +
+      `OOM = OOM &gt; 80% HBM</text>${cells}${xTicks}</svg>`;
     preEl.textContent = JSON.stringify(buildLiveBucketSchedule(wlA), null, 2);
   };
 
@@ -298,32 +339,96 @@ def render_phase_extension_js() -> str:
     if (st) st.textContent = 'Calibrated (MEASURED): ' + STATE.calSource;
     window.wbRenderAll();
   }
+  function quantileSorted(arr, p) {
+    if (!arr.length) return 0.0;
+    const pos = p * (arr.length - 1), lo = Math.floor(pos);
+    const hi = Math.min(arr.length - 1, lo + 1), frac = pos - lo;
+    return arr[lo] * (1.0 - frac) + arr[hi] * frac;
+  }
   function traceEventsToMeas(raw, fileName) {
     const evs = Array.isArray(raw) ? raw
       : (raw && Array.isArray(raw.traceEvents) ? raw.traceEvents : null);
     if (!evs) return raw;
-    const spans = evs.filter(e => e && (!e.ph || e.ph === 'X') &&
-      typeof e.ts === 'number' && typeof e.dur === 'number' && e.dur > 0 &&
-      !/step/i.test(String(e.name || '')) && !/step/i.test(String(e.cat || '')))
+    const valid = evs.filter(e => e && (!e.ph || e.ph === 'X') &&
+      typeof e.ts === 'number' && typeof e.dur === 'number' && e.dur > 0);
+    const isStep = e => /step/i.test(String(e.name || '')) ||
+      /step/i.test(String(e.cat || ''));
+    const isWrap = e => /^(jit[(]|pjit[(]|xla_computation[(]|module_main|__main__)/i
+      .test(String(e.name || '').trim()) ||
+      /xla modules/i.test(String(e.cat || ''));
+    const steps = valid.filter(isStep).sort((a, b) => a.ts - b.ts);
+    const spans = valid.filter(e => !isStep(e) && !isWrap(e))
       .sort((a, b) => a.ts - b.ts);
+    const numLayers = (window.__MK_ADVISOR_ENGINE &&
+      window.__MK_ADVISOR_ENGINE.PROF &&
+      window.__MK_ADVISOR_ENGINE.PROF.num_layers) || 60;
+    if (steps.length > 0) {
+      const minRest = steps.length > 1
+        ? Math.min(...steps.slice(1).map(s => s.dur)) : 0.0;
+      const dropWarmup = steps.length >= 3 ||
+        (steps.length === 2 && steps[0].dur > 2.0 * minRest);
+      const steady = dropWarmup ? steps.slice(1) : steps;
+      const perBnd = [], stepIdles = [], stepDurs = [];
+      for (const st of steady) {
+        const s0 = st.ts, s1 = st.ts + st.dur;
+        const clipped = [];
+        for (const sp of spans) {
+          const a = Math.max(s0, sp.ts), b = Math.min(s1, sp.ts + sp.dur);
+          if (b > a) clipped.push([a, b]);
+        }
+        clipped.sort((u, v) => u[0] - v[0]);
+        let busy = 0.0;
+        if (clipped.length > 0) {
+          let curA = clipped[0][0], curB = clipped[0][1];
+          for (let i = 1; i < clipped.length; i++) {
+            if (clipped[i][0] <= curB) curB = Math.max(curB, clipped[i][1]);
+            else { busy += (curB - curA); curA = clipped[i][0]; curB = clipped[i][1]; }
+          }
+          busy += (curB - curA);
+        }
+        const idle = Math.max(0.0, st.dur - busy);
+        stepIdles.push(idle);
+        stepDurs.push(st.dur);
+        perBnd.push(idle / (2.0 * numLayers));
+      }
+      perBnd.sort((a, b) => a - b);
+      stepIdles.sort((a, b) => a - b);
+      stepDurs.sort((a, b) => a - b);
+      return {
+        schema: 'advisor.measurements.v1',
+        source: { file: fileName },
+        step_time_us: {
+          p50: Number(quantileSorted(stepDurs, 0.5).toFixed(2)),
+          p90: Number(quantileSorted(stepDurs, 0.9).toFixed(2)),
+          n: steady.length
+        },
+        launch_gap_us: {
+          p50: Number(quantileSorted(perBnd, 0.5).toFixed(4)),
+          p90: Number(quantileSorted(perBnd, 0.9).toFixed(4)),
+          n: steady.length,
+          step_idle_gap_us: Number(quantileSorted(stepIdles, 0.5).toFixed(2)),
+          num_layers_norm: numLayers,
+          unit: 'us_per_sublayer_boundary'
+        }
+      };
+    }
     const gaps = [];
     for (let i = 1; i < spans.length; i++) {
       const g = spans[i].ts - (spans[i - 1].ts + spans[i - 1].dur);
       if (g > 0 && g <= 500) gaps.push(g);
     }
     gaps.sort((a, b) => a - b);
-    const q = p => {
-      if (!gaps.length) return 0.0;
-      const pos = p * (gaps.length - 1), lo = Math.floor(pos);
-      const hi = Math.min(gaps.length - 1, lo + 1), frac = pos - lo;
-      return gaps[lo] * (1.0 - frac) + gaps[hi] * frac;
-    };
     return {
       schema: 'advisor.measurements.v1',
       source: { file: fileName },
-      launch_gap_us: { p50: Number(q(0.5).toFixed(4)), p90: Number(q(0.9).toFixed(4)) }
+      launch_gap_us: {
+        p50: Number(quantileSorted(gaps, 0.5).toFixed(4)),
+        p90: Number(quantileSorted(gaps, 0.9).toFixed(4)),
+        n: gaps.length
+      }
     };
   }
+  window.__WB_TRACE_TO_MEAS = traceEventsToMeas;
   async function readCalibrationFile(file) {
     if (!file) return;
     try {

@@ -329,3 +329,60 @@ def test_build_bucket_schedule_and_cli_export(
     stdout_json = capsys.readouterr().out
     assert '"schema": "advisor.bucket_schedule.v1"' in stdout_json
     assert '"consumer_status": "advisory_offline_v1"' in stdout_json
+
+
+def test_phase_map_long_context_oom_hatch_and_conserved_trace_idle(
+    tmp_path: Path,
+) -> None:
+    """Verify 256K/1M phase grid, OOM hatch, and step-idle trace parity."""
+    sweep_report = advisor.advise_regimes("qwen3.5-397b", "tpu7x")
+    html_text = advisor.render_advisor_html(sweep_report)
+    assert "262144, 1048576" in html_text
+    assert 'id="wb-oom-hatch"' in html_text
+    assert "OOM &gt; 80% HBM" in html_text
+    assert "tVal * epDp >= rFloor" in html_text
+    assert "tVal >= 32" not in html_text
+    assert "idle / (2.0 * numLayers)" in html_text
+    assert "us_per_sublayer_boundary" in html_text
+
+    # Verify synthetic Perfetto step trace matches Python calibrate_trace:
+    # 4 steps of 1000 us each, 400 non-overlapping 2.0 us ops = 800 us busy
+    # -> 200 us idle; for 60 layers (120 boundaries), p50 == 200 / 120 == 1.6667 us.
+    events: list[dict[str, object]] = []
+    for step_idx in range(4):
+        base_ts = float(step_idx * 1200)
+        events.append(
+            {
+                "name": f"Step {step_idx}",
+                "cat": "step_marker",
+                "ph": "X",
+                "pid": 1,
+                "tid": 1,
+                "ts": base_ts,
+                "dur": 1000.0,
+            }
+        )
+        events.extend(
+            [
+                {
+                    "name": f"fusion.{op_idx}",
+                    "cat": "hlo_op",
+                    "ph": "X",
+                    "pid": 2,
+                    "tid": 1,
+                    "ts": base_ts + op_idx * 2.5,
+                    "dur": 2.0,
+                }
+                for op_idx in range(400)
+            ]
+        )
+    trace_path = tmp_path / "perfetto_steps.json"
+    out_meas = tmp_path / "cal_out.json"
+    trace_path.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
+    cal_payload = advisor.calibrate_trace(
+        trace_path, out_meas, chip="tpu7x", num_layers=60
+    )
+    py_gap = cal_payload["launch_gap_us"]
+    assert isinstance(py_gap, dict)
+    assert py_gap["p50"] == pytest.approx(200.0 / 120.0, abs=1e-3)
+    assert py_gap["step_idle_gap_us"] == pytest.approx(200.0, abs=1e-2)
