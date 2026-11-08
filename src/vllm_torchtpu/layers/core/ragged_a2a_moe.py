@@ -741,13 +741,15 @@ def _arrival_exchange(
     collective_id,
     window=0,
     prefetch=False,
+    owner=False,
 ):
     """Dispatch, expert MLP and combine in one kernel: each routed token row
     goes straight to the row of its expert's member's sorted lhs, and the member
     starts an expert as soon as that expert's rows have landed; outputs return
-    as in ``_direct_combine``. Returns (out, fits); with fits false nothing was
-    sent and the caller takes the full-size exchange. ``window`` and
-    ``prefetch`` as in ``gmm_v2_mlp_exchange``.
+    as in ``_direct_combine`` (``owner``: as in ``_owner_combine``, already
+    summed over TP). Returns (out, fits); with fits false nothing was sent and
+    the caller takes the full-size exchange. ``window`` and ``prefetch`` as in
+    ``gmm_v2_mlp_exchange``.
     """
     dp_size_, num_tokens, _ = gathered_ids.shape
     local = w1.shape[0]
@@ -769,6 +771,18 @@ def _arrival_exchange(
     )[..., :num_groups].sum(axis=1)  # [D * S, D * E]: one route at most
     counts = hits.sum(axis=0).reshape(dp_size, local)
     fits = counts.sum(axis=1).max() <= routes
+    if owner:
+        # Outputs cross TP columns, so every core of the (dp, tp) group must
+        # take the same branch: bound the routes of every rank of the mesh
+        # (as _capacity_overflow), not only of this column's members.
+        num_ranks = dp_size * tp_size
+        rank = gathered_ids // local
+        routed = (gathered_ids >= 0) & (rank < num_ranks)
+        if skip_padded_tokens:
+            routed = routed & (weights != 0)
+        rank = jnp.where(routed, rank, num_ranks)
+        hit_rank = rank[..., None] == jnp.arange(num_ranks, dtype=jnp.int32)
+        fits = hit_rank.sum(axis=(0, 1, 2), dtype=jnp.int32).max() <= routes
     valid = valid & fits
     before = (jnp.cumsum(hits, axis=0, dtype=jnp.int32) - hits).reshape(
         dp_size, num_tokens, num_groups
@@ -836,13 +850,46 @@ def _arrival_exchange(
         fits, jax.lax.dynamic_index_in_dim(counts, dp_pos, keepdims=False), 0
     )
 
-    # Output rows other members send here: as _direct_combine.
-    own = member_index(topk_ids)
-    weights = topk_weights.astype(x.dtype)
-    weights = jnp.where(jnp.isfinite(weights), weights, 0)
-    remote = (own < dp_size) & (own != dp_pos)
-    if skip_padded_tokens:
-        remote = remote & (weights != 0)
+    me = dp_pos
+    axis, num_members, num_recv_rows = DP_AXIS, dp_size, num_tokens * topk
+    if owner:
+        # Outputs go to their token's owner core (as _owner_combine): TP rank
+        # t // blk of the token's engine, row owner_order * blk + t % blk.
+        # Members are numbered over (dp, tp); the dispatch stays in this TP
+        # rank's column.
+        mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
+        blk = -(-num_tokens // tp_size)
+        my_tp = ep_rank % tp_size
+        me = dp_pos * tp_size + my_tp
+        order = owner_order(gathered_ids.reshape(-1, topk), **mesh).reshape(
+            position.shape
+        )
+        dest_core = home * tp_size + token // blk
+        dest_pos = order * blk + token % blk
+        dest_member = jnp.where(match, dest_core.reshape(1, -1), 0).sum(axis=1)
+        dest_row = jnp.where(match, dest_pos.reshape(1, -1), 0).sum(axis=1)
+        send_member = send_member * tp_size + my_tp
+        pad = blk * tp_size - num_tokens
+        ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
+        owner_weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+        owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
+        owned_weights = jax.lax.dynamic_slice_in_dim(owner_weights, my_tp * blk, blk)
+        valid_owned, _, _, _ = owner_route_key(owned_ids, **mesh)
+        w = owned_weights.astype(x.dtype)
+        w = jnp.where(jnp.isfinite(w), w, 0)
+        if skip_padded_tokens:
+            valid_owned = valid_owned & (w != 0)
+        remote = valid_owned & (owned_ids // local != ep_rank)
+        axis, num_members = (DP_AXIS, TP_AXIS), (dp_size, tp_size)
+        num_recv_rows = blk * topk
+    else:
+        # Output rows other members send here: as _direct_combine.
+        own = member_index(topk_ids)
+        weights = topk_weights.astype(x.dtype)
+        weights = jnp.where(jnp.isfinite(weights), weights, 0)
+        remote = (own < dp_size) & (own != dp_pos)
+        if skip_padded_tokens:
+            remote = remote & (weights != 0)
     expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
 
     if w1_scale.ndim == 3:
@@ -860,7 +907,7 @@ def _arrival_exchange(
         jnp.array([0], dtype=jnp.int32),
         dest_member,
         dest_row,
-        jnp.asarray(dp_pos, jnp.int32)[None],
+        jnp.asarray(me, jnp.int32)[None],
         expected[None],
         send_token,
         send_member,
@@ -869,9 +916,9 @@ def _arrival_exchange(
         num_sends,
         send_offsets,
         size_m=routes,
-        num_recv_rows=num_tokens * topk,
-        axis=DP_AXIS,
-        num_members=dp_size,
+        num_recv_rows=num_recv_rows,
+        axis=axis,
+        num_members=num_members,
         collective_id=collective_id,
         fuse_act=activation,
         maybe_quantize_lhs=not _is_fp4_weight(w1),
@@ -879,6 +926,16 @@ def _arrival_exchange(
         window=window,
         prefetch=prefetch,
     )
+    if owner:
+        owned = owner_sum_kernel(
+            recv,
+            owned_ids,
+            owned_weights,
+            skip_padded_tokens=skip_padded_tokens,
+            dtype=x.dtype,
+            **mesh,
+        )
+        return jax.lax.all_gather(owned, TP_AXIS, tiled=True)[:num_tokens], fits
     out = home_sum_kernel(
         recv,
         topk_ids,
@@ -1327,7 +1384,7 @@ def ragged_a2a_moe_local(
         # (the full exchange already runs the local-routes path over all routes).
         return full()
 
-    if expert_arrival and not owner_combine and direct(rows, routes, 2) is not None:
+    if expert_arrival and direct(rows, routes, 2) is not None:
         # Routes bound the exchange alone here: no token rows are deduplicated.
         out, fits = _arrival_exchange(
             x,
@@ -1351,6 +1408,7 @@ def ragged_a2a_moe_local(
             collective_id=3,
             window=arrival_window,
             prefetch=arrival_prefetch,
+            owner=owner_combine,
         )
         return jax.lax.cond(fits, lambda: out, full)
 

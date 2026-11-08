@@ -536,3 +536,60 @@ def test_expert_arrival_window_matches_returned_partials(
             base.view(np.uint16),
             err_msg=f"window={window} prefetch={prefetch}",
         )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,factor",
+    [
+        (8, 1, 24, 10, 1.1),
+        (4, 2, 48, 10, 1.1),
+        (2, 4, 96, 10, 1.1),
+        (2, 4, 48, 4, 1.5),
+        (4, 2, 24, 10, 0.5),  # routes overflow: full-size exchange
+    ],
+)
+def test_expert_arrival_owner_matches_owner_combine(
+    dp_size, tp_size, num_tokens, topk, factor
+):
+    """In-kernel dispatch with outputs sent to their token's owner core:
+    bitwise the owner-core combine of the capacity exchange, every schedule."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=factor,
+        owner_combine=True,
+    )
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    assert np.abs(base.astype(np.float32)).max() > 0
+    for window, prefetch in [(0, False), (1, True), (2, True), (4, True)]:
+        got = np.asarray(
+            jax.jit(
+                functools.partial(
+                    ragged_a2a_moe,
+                    expert_arrival=True,
+                    arrival_window=window,
+                    arrival_prefetch=prefetch,
+                    **common,
+                )
+            )(*stacked)
+        )
+        np.testing.assert_array_equal(
+            got.view(np.uint16),
+            base.view(np.uint16),
+            err_msg=f"window={window} prefetch={prefetch}",
+        )
