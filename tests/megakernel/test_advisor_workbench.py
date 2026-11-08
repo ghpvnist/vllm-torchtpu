@@ -52,7 +52,12 @@ def test_scope_estimate_subterms_conserve_step_bound(model_name: str) -> None:
             launch_us = cast("float", scope_dict["launch_us"])
             roof_floor = cast("float", scope_dict["roof_floor_us"])
             step_bound = cast("float", scope_dict["step_bound_us"])
-            roof_reconstructed = max(compute_us, hbm_us) + comm_us + fill_drain_us
+            scope_name = cast("str", scope_dict["scope"])
+            roof_reconstructed = (
+                max(compute_us, hbm_us, comm_us) + fill_drain_us
+                if scope_name in ("whole_step", "layer_group")
+                else max(compute_us, hbm_us) + comm_us + fill_drain_us
+            )
             step_reconstructed = roof_reconstructed + repass_spill_us + launch_us
             assert roof_reconstructed == pytest.approx(
                 roof_floor, abs=_ROOF_ROUNDING_BOUND_US
