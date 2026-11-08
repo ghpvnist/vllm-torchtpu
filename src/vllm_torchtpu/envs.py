@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     TPU_TP4_HIER_ALL_REDUCE_BLOCKS: int = 4
     TPU_TP4_HIER_ALL_REDUCE_MAX_ROWS: int = 256
     TPU_CANDIDATE_SAMPLING: bool = False
+    TPU_DP_KV_BALANCE: bool = False
     TPU_GDN_TWO_SLOT_CKPT: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -825,6 +826,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gathered logits (layers/core/candidate_sampling.py). Same
     # distributions; float sums run over the candidates, hence opt-in.
     "TPU_CANDIDATE_SAMPLING": env_bool("TPU_CANDIDATE_SAMPLING", default=False),
+    # Data-parallel API servers send a new request to the engine with the fewest
+    # KV tokens among engines with a free sequence slot, instead of the fewest
+    # requests (core/dp_kv_balance.py). Placement only; outputs are unchanged.
+    "TPU_DP_KV_BALANCE": env_bool("TPU_DP_KV_BALANCE", default=False),
     # Speculative decoding on the unified pool: keep two GDN state blocks per
     # request (the verify window's start state and its last state) instead of
     # one per window position; a partially accepted window is recomputed from

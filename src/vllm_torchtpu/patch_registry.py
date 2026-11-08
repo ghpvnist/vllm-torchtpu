@@ -93,6 +93,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
+    Patch("vllm_torchtpu.core.dp_kv_balance:patch_dp_kv_balance", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
