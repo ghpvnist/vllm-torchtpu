@@ -461,3 +461,78 @@ def test_expert_arrival_matches_returned_partials(
     )
     assert np.abs(base.astype(np.float32)).max() > 0
     np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "dp_size,tp_size,num_tokens,topk,routing,factor",
+    [
+        (8, 1, 24, 10, "uniform", 1.1),  # ~30 rows per expert
+        (8, 1, 12, 2, "uniform", 2.0),  # some experts without rows
+        (8, 1, 48, 4, "hot", 2.0),  # each member's first expert spans tiles
+        (8, 1, 12, 2, "skew", 2.0),
+        (4, 2, 24, 2, "uniform", 2.0),
+        (8, 1, 24, 10, "uniform", 0.5),  # routes overflow: full-size exchange
+    ],
+)
+def test_expert_arrival_window_matches_returned_partials(
+    dp_size, tp_size, num_tokens, topk, routing, factor
+):
+    """Sends started a bounded number of groups ahead (window), and each
+    group's first tile copied in during the previous group (prefetch): bitwise
+    the returned-partials exchange for every schedule."""
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    num_experts = 64
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, num_experts, topk=topk, skew=routing == "skew"
+    )
+    if routing == "hot":
+        local = num_experts // 8
+        logits = jax.random.normal(
+            jax.random.key(5), (8 // tp_size, 1, num_tokens, num_experts)
+        )
+        logits = logits + jnp.where(jnp.arange(num_experts) % local == 0, 3.0, 0.0)
+        logits = jnp.broadcast_to(
+            logits, (8 // tp_size, tp_size, num_tokens, num_experts)
+        )
+        weights, ids = jax.lax.top_k(
+            jax.nn.softmax(logits.reshape(-1, num_experts)), topk
+        )
+        weights, ids = weights.astype(jnp.bfloat16), ids.astype(jnp.int32)
+        rows = np.bincount(np.asarray(ids).reshape(-1), minlength=num_experts)
+        assert rows.max() > 64  # some group needs two row tiles
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    common = dict(
+        mesh=mesh,
+        topk=topk,
+        activation="silu",
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+            dp_size * num_tokens * topk
+        ),
+        capacity_factor=factor,
+    )
+    base = np.asarray(jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked))
+    assert np.abs(base.astype(np.float32)).max() > 0
+    for window, prefetch in [(1, True), (2, True), (4, True), (0, True), (2, False)]:
+        got = np.asarray(
+            jax.jit(
+                functools.partial(
+                    ragged_a2a_moe,
+                    direct_combine=True,
+                    expert_arrival=True,
+                    arrival_window=window,
+                    arrival_prefetch=prefetch,
+                    **common,
+                )
+            )(*stacked)
+        )
+        np.testing.assert_array_equal(
+            got.view(np.uint16),
+            base.view(np.uint16),
+            err_msg=f"window={window} prefetch={prefetch}",
+        )

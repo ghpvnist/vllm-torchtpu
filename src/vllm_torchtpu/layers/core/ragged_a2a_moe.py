@@ -739,12 +739,15 @@ def _arrival_exchange(
     skip_padded_tokens,
     routes,
     collective_id,
+    window=0,
+    prefetch=False,
 ):
     """Dispatch, expert MLP and combine in one kernel: each routed token row
     goes straight to the row of its expert's member's sorted lhs, and the member
     starts an expert as soon as that expert's rows have landed; outputs return
     as in ``_direct_combine``. Returns (out, fits); with fits false nothing was
-    sent and the caller takes the full-size exchange.
+    sent and the caller takes the full-size exchange. ``window`` and
+    ``prefetch`` as in ``gmm_v2_mlp_exchange``.
     """
     dp_size_, num_tokens, _ = gathered_ids.shape
     local = w1.shape[0]
@@ -800,6 +803,14 @@ def _arrival_exchange(
     )
     send_token = send_route // topk
     num_sends = mine.sum(dtype=jnp.int32)[None]
+    # First send of each owner group (the sends are in group order).
+    group_sends = (
+        (my_group.reshape(-1, 1) == jnp.arange(local, dtype=jnp.int32))
+        & mine.reshape(-1, 1)
+    ).sum(axis=0, dtype=jnp.int32)
+    send_offsets = jnp.concatenate(
+        [jnp.zeros((1,), jnp.int32), jnp.cumsum(group_sends, dtype=jnp.int32)]
+    )
 
     # This member's lhs rows: whose output each one is, and where it lands.
     position = route_order(
@@ -856,6 +867,7 @@ def _arrival_exchange(
         send_row,
         send_group,
         num_sends,
+        send_offsets,
         size_m=routes,
         num_recv_rows=num_tokens * topk,
         axis=DP_AXIS,
@@ -864,6 +876,8 @@ def _arrival_exchange(
         fuse_act=activation,
         maybe_quantize_lhs=not _is_fp4_weight(w1),
         rhs_quant_dtype=rhs_quant_dtype,
+        window=window,
+        prefetch=prefetch,
     )
     out = home_sum_kernel(
         recv,
@@ -1151,6 +1165,8 @@ def ragged_a2a_moe_local(
     direct_combine: bool = False,
     expert_arrival: bool = False,
     owner_combine: bool = False,
+    arrival_window: int = 0,
+    arrival_prefetch: bool = False,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
 
@@ -1333,6 +1349,8 @@ def ragged_a2a_moe_local(
             skip_padded_tokens=skip_padded_tokens,
             routes=routes,
             collective_id=3,
+            window=arrival_window,
+            prefetch=arrival_prefetch,
         )
         return jax.lax.cond(fits, lambda: out, full)
 
@@ -1387,6 +1405,8 @@ def ragged_a2a_moe(
     direct_combine: bool = False,
     expert_arrival: bool = False,
     owner_combine: bool = False,
+    arrival_window: int = 0,
+    arrival_prefetch: bool = False,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
     two leading axes [dp, tp, ...], and so is the result [dp, tp, S, H]."""
@@ -1406,6 +1426,8 @@ def ragged_a2a_moe(
         direct_combine=direct_combine,
         expert_arrival=expert_arrival,
         owner_combine=owner_combine,
+        arrival_window=arrival_window,
+        arrival_prefetch=arrival_prefetch,
     )
 
     def body(*args):

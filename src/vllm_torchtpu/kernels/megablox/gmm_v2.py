@@ -1668,6 +1668,7 @@ class ArrivalRefs:
     send_row: jax.Array  # SMEM int32[num_sends]
     send_group: jax.Array  # SMEM int32[num_sends]
     num_sends: jax.Array  # SMEM int32[1]
+    send_offsets: jax.Array  # SMEM int32[size_group + 1]: first send of each group
     tokens: jax.Array  # HBM [num_tokens, row_sublanes, size_k / row_sublanes]
     landing: jax.Array  # HBM [size_m + tile_m, row_sublanes, size_k / row_sublanes]
     lhs: jax.Array  # VMEM [2, tile_m, row_sublanes, size_k / row_sublanes]
@@ -1676,6 +1677,12 @@ class ArrivalRefs:
     arrive_sems: jax.Array  # DMA[size_group]
     send_sem: jax.Array  # DMA[1]
     sent: jax.Array  # SMEM int32[1]: remote rows sent
+    issued: jax.Array  # SMEM int32[1]: sends started
+    # Groups whose sends start before the member waits for a group's rows:
+    # the sends of groups below `group + window` (0: every send at entry).
+    window: int = 0
+    # A group's first tile is copied in during the previous group's last tile.
+    prefetch: bool = False
 
 
 def _axes(axis, num_members):
@@ -1818,9 +1825,10 @@ def _mlp_kernel(
         for c in copies:
             c.wait()
 
-    def dispatch_rows():
-        """Send this member's routed token rows to the row each owner's sorted
-        lhs reserves for them; the owner counts arrivals per local group."""
+    def dispatch_rows(lo, hi):
+        """Send this member's routed token rows `lo..hi` (send order) to the
+        row each owner's sorted lhs reserves for them; the owner counts
+        arrivals per local group."""
         ar = arrival
         me = scatter.me[0]
 
@@ -1848,7 +1856,30 @@ def _mlp_kernel(
 
             return remote + 1 - is_local.astype(jnp.int32)
 
-        ar.sent[0] = lax.fori_loop(0, ar.num_sends[0], send, jnp.int32(0))
+        ar.sent[0] = lax.fori_loop(lo, hi, send, ar.sent[0])
+
+    def issue_sends(group_id):
+        """Start the sends of the owner groups below `group_id + window` that
+        have not started (every send with window 0). Sends are in group order,
+        so a member that waits for group g's rows has started its own sends of
+        every group up to g, and the waits cannot deadlock."""
+        ar = arrival
+        if ar.window:
+            hi = ar.send_offsets[jnp.minimum(group_id + ar.window, dims.size_group)]
+        else:
+            hi = ar.num_sends[0]
+        lo = ar.issued[0]
+
+        @pl.when(hi > lo)
+        def _():
+            with jax.named_scope("mlp_issue"):
+                dispatch_rows(lo, hi)
+            ar.issued[0] = hi
+
+    def wait_arrival(group_id):
+        ar = arrival
+        size = lhs_group_sizes_ref[group_offset + group_id]
+        wait_rows(ar.arrive_sems.at[group_id], ar.landing, size)
 
     # The first tile's weights start copying before the metadata loop: the
     # first local group with rows, which fill_metadata assigns to tile 0.
@@ -1872,16 +1903,20 @@ def _mlp_kernel(
     if scatter is not None:
         # No row may land in a member's receive buffer before that member runs
         # this kernel.
-        member_barrier(scatter.axis, scatter.num_members)
+        with jax.named_scope("mlp_barrier"):
+            member_barrier(scatter.axis, scatter.num_members)
         for i in range(4):
             scatter.in_flight[i] = 0
     if arrival is not None:
-        dispatch_rows()
+        arrival.sent[0] = 0
+        arrival.issued[0] = 0
+        issue_sends(jnp.int32(0))
 
     tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
-    num_gm = fill_metadata(
-        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=tiled
-    )
+    with jax.named_scope("mlp_metadata"):
+        num_gm = fill_metadata(
+            lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=tiled
+        )
 
     def scaled_matmul(tiled_lhs, rhs: RhsRef, c: GmmConfigs, bucket_m: int):
         """Step 2 of `inner_kernel._matmul` on the unquantized-lhs path."""
@@ -1961,19 +1996,25 @@ def _mlp_kernel(
 
     def load_lhs(gm_id, slot, group_id, is_new_group, m_offset):
         """The tile's rows in VMEM: a group's first tile waits for all of the
-        group's rows to land, then copies; later tiles were prefetched."""
+        group's rows to land, then copies (with `prefetch`, only the first
+        tile of all); later tiles were prefetched."""
         ar = arrival
+        copy_here = is_new_group
+        if ar.prefetch:
+            copy_here = gm_id == 0
 
-        @pl.when(is_new_group)
+        @pl.when(copy_here)
         def _():
+            issue_sends(group_id)
             with jax.named_scope("mlp_wait_arrival"):
-                size = lhs_group_sizes_ref[group_offset + group_id]
-                wait_rows(ar.arrive_sems.at[group_id], ar.landing, size)
+                wait_arrival(group_id)
             lhs_copy(m_offset, slot).start()
 
-        lhs_copy(m_offset, slot).wait()
+        with jax.named_scope("mlp_wait_lhs"):
+            lhs_copy(m_offset, slot).wait()
         # One relayout per tile to the matmul layout, shared by the parts.
-        ar.lhs_rows[...] = ar.lhs[slot].reshape(tile_m, size_k)
+        with jax.named_scope("mlp_relayout"):
+            ar.lhs_rows[...] = ar.lhs[slot].reshape(tile_m, size_k)
 
     def body(tiled_lhs_ref, tiled_out_ref=None, *, gm_id=None):
         if gm_id is None:
@@ -2063,12 +2104,23 @@ def _mlp_kernel(
                 start(up_copies(p, next_group_id))
 
         if arrival is not None:
+            next_offset = metadata_ref.gm_id_to_m_offset[jnp.minimum(gm_id + 1, num_gm)]
+            next_offset = next_offset - next_offset % sub
+
             # The next tile of the same group: its rows have all landed.
             @pl.when(jnp.logical_and(has_next, next_group_id == group_id))
             def _():
-                next_offset = metadata_ref.gm_id_to_m_offset[gm_id + 1]
-                next_offset = next_offset - next_offset % sub
                 lhs_copy(next_offset, 1 - slot).start()
+
+            if arrival.prefetch:
+                # The next group's first tile, once all of its rows have landed:
+                # the copy overlaps this tile's down projection and sends.
+                @pl.when(fetch_next)
+                def _():
+                    issue_sends(next_group_id)
+                    with jax.named_scope("mlp_wait_arrival_next"):
+                        wait_arrival(next_group_id)
+                    lhs_copy(next_offset, 1 - slot).start()
 
         # The gate/up kernel stores its rows with `out[0] += partial` in each of
         # its gm tiles, and the next tile adds this tile's last partial sublane
@@ -2147,16 +2199,23 @@ def _mlp_kernel(
             return carry
 
         lax.fori_loop(0, num_gm, tile, 0)
-        wait_rows(arrival.send_sem.at[0], arrival.landing, arrival.sent[0])
+        # Sends of groups no tile here waited for.
+        issue_sends(jnp.int32(dims.size_group))
+        with jax.named_scope("mlp_tail"):
+            wait_rows(arrival.send_sem.at[0], arrival.landing, arrival.sent[0])
     elif scatter is not None:
         pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
         pipeline_fn(lhs_ref.reshape(-1, sub, lhs_ref.shape[-1]))
     if scatter is not None:
         # Every row sent from here has left, and every row bound here has landed.
-        for i in range(2):
-            wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
-            wait_rows(scatter.local_sems.at[i], scatter.recv, scatter.in_flight[2 + i])
-        wait_rows(scatter.recv_sem.at[0], scatter.recv, scatter.expected[0])
+        with jax.named_scope("mlp_wait_sent"):
+            for i in range(2):
+                wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
+                wait_rows(
+                    scatter.local_sems.at[i], scatter.recv, scatter.in_flight[2 + i]
+                )
+        with jax.named_scope("mlp_wait_recv"):
+            wait_rows(scatter.recv_sem.at[0], scatter.recv, scatter.expected[0])
         return
     out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
     pipeline_fn = pltpu.emit_pipeline(
@@ -2629,6 +2688,7 @@ def mlp_exchange_kernel_main(
     send_row_ref,
     send_group_ref,
     num_sends_ref,
+    send_offsets_ref,
     tokens_ref,
     w1_ref,
     s1_ref,
@@ -2657,10 +2717,13 @@ def mlp_exchange_kernel_main(
     arrive_sems,
     dispatch_sem,
     sent_ref,
+    issued_ref,
     *,
     cfgs: MlpConfigs,
     axis: str,
     num_members: int,
+    window: int,
+    prefetch: bool,
 ):
     """Entry point of `gmm_v2_mlp_exchange`."""
     _mlp_kernel(
@@ -2704,6 +2767,7 @@ def mlp_exchange_kernel_main(
             send_row=send_row_ref,
             send_group=send_group_ref,
             num_sends=num_sends_ref,
+            send_offsets=send_offsets_ref,
             tokens=tokens_ref,
             landing=landing_ref,
             lhs=lhs_buf,
@@ -2712,6 +2776,9 @@ def mlp_exchange_kernel_main(
             arrive_sems=arrive_sems,
             send_sem=dispatch_sem,
             sent=sent_ref,
+            issued=issued_ref,
+            window=window,
+            prefetch=prefetch,
         ),
     )
 
@@ -2730,6 +2797,8 @@ def mlp_exchange_kernel_main(
         "vmem_limit_bytes",
         "maybe_quantize_lhs",
         "rhs_quant_dtype",
+        "window",
+        "prefetch",
     ]
 )
 def gmm_v2_mlp_exchange(
@@ -2749,6 +2818,7 @@ def gmm_v2_mlp_exchange(
     send_row: jax.Array,  # int32[num_sends]
     send_group: jax.Array,  # int32[num_sends]
     num_sends: jax.Array,  # int32[1]
+    send_offsets: jax.Array,  # int32[size_group + 1]
     *,
     size_m: int,
     num_recv_rows: int,
@@ -2762,6 +2832,8 @@ def gmm_v2_mlp_exchange(
     vmem_limit_bytes: int | None = None,
     maybe_quantize_lhs: bool = True,
     rhs_quant_dtype: jnp.dtype | None = None,
+    window: int = 0,
+    prefetch: bool = False,
 ) -> jax.Array:
     """`gmm_v2_mlp_scatter` that also receives its lhs from the members.
 
@@ -2771,6 +2843,13 @@ def gmm_v2_mlp_exchange(
     `group_sizes` rows of that group have landed, instead of after the whole
     exchange. lhs rows are routed rows sorted by group as in `gmm_v2_mlp`
     (`size_m` of them); outputs go out as in `gmm_v2_mlp_scatter`.
+
+    Sends are in group order; `send_offsets[g]` is the first send of group g
+    (`send_offsets[size_group] == num_sends[0]`). With `window` w > 0 a member
+    starts the sends of groups below w at entry and those below g + w just
+    before it waits for group g's rows; with 0, all at entry. With `prefetch`
+    each group's first tile is copied in during the previous group's last
+    tile.
     """
 
     size_k = tokens.shape[1]
@@ -2840,6 +2919,7 @@ def gmm_v2_mlp_exchange(
         pltpu.SemaphoreType.DMA((dims.size_group,)),
         pltpu.SemaphoreType.DMA((1,)),
         pltpu.SMEM((1,), jnp.int32),
+        pltpu.SMEM((1,), jnp.int32),
     ]
     cost_up = get_cost_estimate(up)
     cost_down = get_cost_estimate(down)
@@ -2852,20 +2932,26 @@ def gmm_v2_mlp_exchange(
         f"gmm_v2_mlp_exchange-g_{dims.size_group}-m_{dims.size_m}-k_{dims.size_k}"
         f"-act_{fuse_act}-n_{dims.size_n}-n2_{size_n}-tm_{cfgs.tile_m}"
         f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
+        f"-w_{window}{'p' if prefetch else ''}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     row_view = tokens.reshape(tokens.shape[0], row_sub, size_k // row_sub)
     # Both outputs pinned to HBM: other members write into them.
     recv, _ = pl.pallas_call(
         functools.partial(
-            mlp_exchange_kernel_main, cfgs=cfgs, axis=axis, num_members=num_members
+            mlp_exchange_kernel_main,
+            cfgs=cfgs,
+            axis=axis,
+            num_members=num_members,
+            window=window,
+            prefetch=prefetch,
         ),
         out_shape=(
             pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), tokens.dtype),
             pltpu.HBM((size_m + cfgs.tile_m, row_sub, size_k // row_sub), tokens.dtype),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=11,
+            num_scalar_prefetch=12,
             in_specs=[hbm] * 5,
             out_specs=(hbm, hbm),
             scratch_shapes=scratch_shapes,
@@ -2889,6 +2975,7 @@ def gmm_v2_mlp_exchange(
         send_row,
         send_group,
         num_sends,
+        send_offsets,
         pltpu.with_memory_space_constraint(row_view, pltpu.HBM),
         w1,
         w1_scale,
