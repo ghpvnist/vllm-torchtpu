@@ -73,6 +73,10 @@ LAYOUT=tp32dcp8 GLOBAL_SEQS=96 "$PYTHON_BIN" bench_sweep.py --stage <arm> --inpu
 `SUMMARY` line; the `steady` block carries the comparable numbers (`tokens_per_second`,
 `mean_request_tpot_ms`). `cached_tokens_hist` must show `131071` for every request.
 `BENCH_TEMPERATURE`, `BENCH_TOP_P` and `BENCH_TOP_K` set the request sampling (greedy by default).
+`BENCH_LENGTHS`, `BENCH_ASSIGN` and `BENCH_PASSES` give the requests mixed context lengths and choose
+how they are placed on the engines, one or several runs per boot ([mixed_lengths.py](mixed_lengths.py),
+[bench_sweep.py](bench_sweep.py)); the launch env `SYNTHETIC_DECODE_KV_LOG=1` logs each engine's KV tokens per step,
+and [pass_report.py](pass_report.py) gives each run's device step and per-engine KV from the server logs.
 
 On a cluster, [recipes/](recipes) holds one JobSet per slice (`q38-decode-4h`, `-8h`, `-16h`) that
 runs a list of arms on one slice: boot, measured run, device step from the `pjrt_client` log
@@ -108,6 +112,7 @@ all-to-all exchange (`MOE_A2A=1`), set `MNBT` to the decode step's tokens (reque
 | `FUSED_COMBINE` | 0 | `1`: under DP + EP, finish each MoE layer with one all-reduce over the EP group (shared expert folded in, each rank keeps its own tokens' rows) instead of the DP reduce-scatter plus the TP all-reduce (`TPU_MOE_FUSED_COMBINE`); same values, different addition order |
 | `WEIGHTS` | dummy | `real` loads the checkpoint at `MODEL_PATH` |
 | `KV_MODE` | synthetic | `normal` = real prefill with prefix caching (required with real weights; measure with `../benchmark_window.py`) |
+| `API_SERVERS` | | `--api-server-count` (vLLM's default is one API server per local engine; each balances only the requests it receives) |
 | `EXTRA_ARGS` | | appended to `vllm serve` |
 
 Compile sizes are derived: `[max-num-seqs, max-num-seqs * (MTP_K + 1), MNBT]`.

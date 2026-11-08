@@ -38,6 +38,7 @@
 #                 one DP reduce-scatter per lookup, bitwise the vocab-parallel lookup); "" = vocab-parallel over TP
 #   WEIGHTS       dummy (default) | real: real checkpoint at MODEL_PATH
 #   KV_MODE       synthetic (default, needs dummy weights) | normal: real prefill with prefix caching
+#   API_SERVERS   "" (vLLM default: one API server per local engine) | N: --api-server-count N
 #   EXTRA_ARGS    appended verbatim to vllm serve
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -68,6 +69,8 @@ SYNTH_ACCEPT=${SYNTH_ACCEPT:-}
 CANDIDATE_SAMPLING=${CANDIDATE_SAMPLING:-0}
 KV_MODE=${KV_MODE:-synthetic}
 read -r -a EXTRA_ARGV <<< "${EXTRA_ARGS:-}"
+API_ARGS=()
+[[ -n "${API_SERVERS:-}" ]] && API_ARGS=(--api-server-count "$API_SERVERS")
 cd "$(dirname -- "$0")/.."
 
 if [[ "$FUSED_DRAFT" == 1 ]]; then
@@ -171,7 +174,7 @@ elif [[ -n "$HOT_SET" ]]; then
   [[ "${HS_SPREAD:-}" == spread ]] && export TPU_MOE_HOT_SET_SPREAD=1
 fi
 export TORCH_TPU_TIER2_COMPILATION_CACHE="native_decode_${LAYOUT}_${POD_IP}"
-echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK topology=$TPU_TOPOLOGY wrap=$TPU_TOPOLOGY_WRAP engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} a2a_async=${A2A_ASYNC:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} headless=${HEADLESS_ARGS[*]:-no}"
+echo "HILLCLIMB layout=$LAYOUT host=$HOST_RANK topology=$TPU_TOPOLOGY wrap=$TPU_TOPOLOGY_WRAP engines=$ENGINES seqs/engine=$SEQS_PER_ENGINE mtp=$MTP_K mnbt=$MNBT compile=$COMPILE_SIZES kv=$KV_BYTES async=$ASYNC_SCHED fused_ep=$FUSED_EP w4a8=$W4A8 expert_block=${EXPERT_BLOCK:-16} attn_block=${ATTN_BLOCK:-default} verify_block=${VERIFY_BLOCK:-default} draft_one_query=$DRAFT_ONE_QUERY moe_a2a=$MOE_A2A a2a_sc_offload=${A2A_SC_OFFLOAD:-default} a2a_async=${A2A_ASYNC:-default} fused_draft=$FUSED_DRAFT fast_subst=$FAST_SUBST lm_head_hidden_major=$LM_HEAD_HIDDEN_MAJOR embed_shard=${EMBED_SHARD:-tp} packed_dispatch=$PACKED_DISPATCH fused_combine=$FUSED_COMBINE weights=$WEIGHTS kv_mode=$KV_MODE synth_accept=${SYNTH_ACCEPT:-none} candidate_sampling=$CANDIDATE_SAMPLING hot_set=${HOT_SET:-none} api_servers=${API_SERVERS:-default} headless=${HEADLESS_ARGS[*]:-no}"
 
 exec numactl --interleave=all "$VLLM_BIN" serve \
   --pipeline-parallel-size 1 \
@@ -213,4 +216,5 @@ exec numactl --interleave=all "$VLLM_BIN" serve \
   --enable-prompt-tokens-details \
   "${KV_ARGS[@]}" \
   "${CACHE_ARGS[@]}" \
+  "${API_ARGS[@]}" \
   "${EXTRA_ARGV[@]}"

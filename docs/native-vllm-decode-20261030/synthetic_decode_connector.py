@@ -12,10 +12,19 @@ SYNTHETIC_DECODE_SAMPLING_FALLBACKS=1 also counts the verify steps whose
 candidate sampling fell back to the full vocabulary; the count is materialized
 every step, which splits the step's deferred sampling ops, so timing runs leave
 it off.
+
+SYNTHETIC_DECODE_KV_LOG=1: each engine's scheduler logs every step its request
+count and KV tokens (SYNTHETIC_DECODE_KV: sum and max over the scheduled
+requests of computed + scheduled tokens), to compare engines under mixed
+context lengths. SYNTHETIC_DECODE_REZERO_IDLE=1 zeroes the pool again whenever
+a step fills requests and the worker's batch holds no other request (an idle
+engine starting a new client run), so every run of one boot starts from the
+pool the first run after boot sees.
 """
 
 import functools
 import os
+import time
 
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector import (
@@ -183,6 +192,13 @@ class SyntheticTPUDecodeConnector(DecodeBenchConnector):
             return
         if self._runner is None:
             raise RuntimeError("Runner not registered")
+        if (
+            self._pool_initialized
+            and os.environ.get("SYNTHETIC_DECODE_REZERO_IDLE") == "1"
+        ):
+            live = {r for r in self._runner.input_batch.req_ids if r is not None}
+            if live and live <= set(metadata.reqs_to_fill):
+                self._pool_initialized = False
         if not self._pool_initialized:
             from vllm_torchtpu.utils import synchronize_tensors
 
@@ -223,7 +239,28 @@ class SyntheticTPUDecodeConnector(DecodeBenchConnector):
                 len(meta.reqs_to_fill),
             )
         self._audit_steps += 1
+        if os.environ.get("SYNTHETIC_DECODE_KV_LOG") == "1":
+            _log_engine_kv(self._vllm_config, scheduler_output)
         return meta
+
+
+def _log_engine_kv(vllm_config, scheduler_output):
+    """One line per scheduler step: this engine's requests and KV tokens."""
+    scheduled = scheduler_output.num_scheduled_tokens
+    computed = {
+        r.req_id: r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs
+    }
+    cached = scheduler_output.scheduled_cached_reqs
+    computed.update(zip(cached.req_ids, cached.num_computed_tokens))
+    kv = [computed.get(r, 0) + n for r, n in scheduled.items()]
+    logger.info(
+        "SYNTHETIC_DECODE_KV dp=%d t=%.3f reqs=%d kv_tokens=%d max_tokens=%d",
+        vllm_config.parallel_config.data_parallel_rank,
+        time.time(),
+        len(kv),
+        sum(kv),
+        max(kv, default=0),
+    )
 
 
 # Preserve the platform's benchmark connector dispatch; the explicit external

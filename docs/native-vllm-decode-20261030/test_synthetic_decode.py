@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import inspect
+import os
 import sys
 import unittest
 from types import SimpleNamespace as NS
@@ -78,6 +79,47 @@ class TestSynthetic(unittest.TestCase):
             )
             c.start_load_kv(None)
         self.assertEqual(zeroed, [(raws, sync)])
+
+    def test_pool_rezero_idle(self):
+        raws = [object()]
+        c = C.__new__(C)
+        c._runner = NS(kv_cache_raw_tensors=raws, input_batch=NS(req_ids=["a", None]))
+        c._pool_initialized = True
+        zeroed = []
+
+        def fill(req_ids, batch):
+            c._runner.input_batch.req_ids = batch
+            c._connector_metadata = DecodeBenchConnectorMetadata(
+                reqs_to_fill={r: (([],), 131071) for r in req_ids}
+            )
+            c.start_load_kv(None)
+
+        with (
+            patch.dict(
+                sys.modules, {"vllm_torchtpu.utils": NS(synchronize_tensors=None)}
+            ),
+            patch.object(module, "_zero_pool_in_place", lambda r, s: zeroed.append(r)),
+        ):
+            fill(["a"], ["a", None])  # knob off: the first zero is the only one
+            with patch.dict(os.environ, {"SYNTHETIC_DECODE_REZERO_IDLE": "1"}):
+                fill(["b"], ["a", "b"])  # joins a live request: no zero
+                fill(["c", "d"], ["c", None, "d"])  # idle engine, new run: zero
+        self.assertEqual(zeroed, [raws])
+
+    def test_engine_kv_log(self):
+        out = NS(
+            num_scheduled_tokens={"n": 1, "a": 4, "b": 4},
+            scheduled_new_reqs=[NS(req_id="n", num_computed_tokens=16383)],
+            scheduled_cached_reqs=NS(
+                req_ids=["a", "b"], num_computed_tokens=[131000, 50000]
+            ),
+        )
+        cfg = NS(parallel_config=NS(data_parallel_rank=3))
+        with self.assertLogs(module.logger, level="INFO") as logs:
+            module._log_engine_kv(cfg, out)
+        line = logs.output[-1]
+        self.assertIn("SYNTHETIC_DECODE_KV dp=3 ", line)
+        self.assertIn(" reqs=3 kv_tokens=197392 max_tokens=131004", line)
 
 
 if __name__ == "__main__":
